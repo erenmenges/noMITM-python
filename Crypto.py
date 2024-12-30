@@ -1,8 +1,11 @@
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.hashes import SHA256, Hash
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+import os
 
 class Crypto:
     def generate_key_pair():
@@ -27,27 +30,53 @@ class Crypto:
         )
         return (public_pem, private_pem)
     
-def derive_session_key(peer_public_key, private_key):
-    """
-    Derives a shared session key using ECDH (Elliptic Curve Diffie-Hellman).
+    def derive_session_key(peer_public_key, private_key):
+        # Perform key agreement to derive the shared secret
+        shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
 
-    Args:
-        peer_public_key: The public key of the peer (EllipticCurvePublicKey).
-        private_key: Your private key (EllipticCurvePrivateKey).
+        # Use HKDF to derive a symmetric session key from the shared secret
+        derived_key = HKDF(
+            algorithm=SHA256(),
+            length=32,  # Length of the derived key in bytes
+            salt=None,  # You can provide a salt for better security
+            info=b"session_key",  # Contextual information
+            backend=default_backend()
+        ).derive(shared_secret)
 
-    Returns:
-        A derived session key as bytes.
-    """
-    # Perform key agreement to derive the shared secret
-    shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
+        return derived_key
 
-    # Use HKDF to derive a symmetric session key from the shared secret
-    derived_key = HKDF(
-        algorithm=SHA256(),
-        length=32,  # Length of the derived key in bytes
-        salt=None,  # You can provide a salt for better security
-        info=b"session_key",  # Contextual information
-        backend=default_backend()
-    ).derive(shared_secret)
+    def aes_encrypt(data, key):
+        # Generate a random initialization vector (IV)
+        iv = os.urandom(16)
 
-    return derived_key
+        # Create a Cipher object with AES algorithm in CBC mode
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+
+        # Pad the data to be a multiple of the block size (16 bytes for AES)
+        padder = PKCS7(algorithms.AES.block_size).padder()
+        padded_data = padder.update(data) + padder.finalize()
+
+        # Encrypt the data
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        return iv, ciphertext
+    
+    def aes_decrypt(iv, ciphertext, key):
+        # Create a Cipher object with AES algorithm in CBC mode
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+
+        # Decrypt the data
+        decryptor = cipher.decryptor()
+        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+
+        # Remove padding from the decrypted data
+        unpadder = PKCS7(algorithms.AES.block_size).unpadder()
+        data = unpadder.update(padded_data) + unpadder.finalize()
+
+        return data
+
+    def hash(data):
+        digest = Hash(SHA256(), backend=default_backend())
+        digest.update(data)
+        return digest.finalize()
