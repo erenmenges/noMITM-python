@@ -1,12 +1,15 @@
 import threading
 import socket
-from Communications import packageMessage, parseMessage, sendData, receiveData
+from Communications import packageMessage, parseMessage, sendData, receiveData, MessageType
 from Crypto import Crypto, SecureMessage
 from KeyManagement import KeyManagement
 from Utils import NonceManager, log_event, log_error, ErrorCode, ErrorMessage
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography import x509
 from security.TLSWrapper import TLSWrapper
+from cryptography.x509 import load_pem_x509_certificate
+from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
 
 class Client:
     def __init__(self):
@@ -21,6 +24,8 @@ class Client:
         self.private_key = None  # Add attribute to store client's private key
         self.public_key = None   # Add attribute to store client's public key
         self.socket = None  # Add attribute to store the active socket
+        self.certificate = None  # Add certificate attribute
+        self.server_certificate = None  # Add server certificate attribute
 
         # Schedule automated key renewal every 3600 seconds (1 hour)
         renewal_interval = 3600
@@ -46,8 +51,13 @@ class Client:
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(30)
 
-                # If TLS is enabled, wrap the socket
+                # If TLS is enabled, wrap the socket and perform certificate exchange
                 if hasattr(self, 'tls_config') and self.tls_config.enabled:
+                    # Load client certificate if configured
+                    if self.tls_config.cert_path:
+                        self.certificate = self.key_manager.load_certificate(self.tls_config.cert_path)
+                        log_event("Security", "Client certificate loaded.")
+
                     tls_wrapper = TLSWrapper(self.tls_config)
                     self.socket = tls_wrapper.wrap_socket(
                         self.socket,
@@ -55,6 +65,16 @@ class Client:
                         server_hostname=destination[0]
                     )
                     log_event("Security", "TLS connection established.")
+
+                    # Get and validate server certificate
+                    self.server_certificate = self.socket.getpeercert(binary_form=True)
+                    if self.server_certificate:
+                        self.server_certificate = load_pem_x509_certificate(
+                            self.server_certificate,
+                            default_backend()
+                        )
+                        self._validate_server_certificate()
+                        log_event("Security", "Server certificate validated.")
 
                 self.socket.connect(destination)
                 log_event("Network", f"Connected to server at {destination}.")
@@ -252,37 +272,23 @@ class Client:
 
     def handle_key_renewal_request(self):
         """
-        Handles the key renewal process by generating a new key pair and sending the new public key to the server.
+        Handles the key renewal process by delegating to KeyManagement.
         """
         try:
-            # Generate new key pair
-            new_public_pem, new_private_pem = Crypto.generate_key_pair()
-            log_event("Key Renewal", "Generated new key pair for renewal.")
-
+            # Use KeyManagement to handle the renewal request
+            session_key, public_key = self.key_manager.handle_key_renewal_request(self.server_public_key)
+            
             # Send the new public key to the server
-            sendData(self.socket, new_public_pem)
+            sendData(self.socket, public_key)
             log_event("Key Renewal", "Sent new public key to server.")
 
-            # Load the new private key
-            new_private_key = serialization.load_pem_private_key(
-                new_private_pem,
-                password=None,
-                backend=default_backend()
-            )
-            log_event("Key Renewal", "Loaded new private key.")
-
-            # Assume server sends its new public key in response
+            # Receive the server's new public key
             server_new_public_pem = receiveData(self.socket)
             server_new_public_key = serialization.load_pem_public_key(
                 server_new_public_pem,
                 backend=default_backend()
             )
             log_event("Key Renewal", "Received new public key from server.")
-
-            # Derive the new session key
-            context = b"session key derivation"
-            new_session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
-            log_event("Session", "New session key derived successfully.")
 
             # Send key renewal response acknowledgment
             renewal_ack = packageMessage(
@@ -296,33 +302,24 @@ class Client:
             log_event("Key Renewal", "Sent key renewal acknowledgment to server.")
 
             with self._lock:
-                self.private_key = new_private_key
                 self.server_public_key = server_new_public_key
-                self.session_key = new_session_key
+                self.session_key = session_key
 
         except Exception as e:
             log_event("Error", f"Key renewal failed: {e}")
+            self.terminate_session()  # Critical failure should terminate session
 
     def handle_key_renewal_response(self):
         """
-        Handles the key renewal response from the server by deriving the new session key.
+        Handles the key renewal response by delegating to KeyManagement.
         """
         try:
-            # Assume client sends its new public key in response
-            client_new_public_pem, client_new_private_pem = Crypto.generate_key_pair()
-            log_event("Key Renewal", "Generated new key pair for renewal.")
-
+            # Use KeyManagement to initiate key renewal
+            private_key, public_key = self.key_manager.initiate_key_renewal()
+            
             # Send the new public key to the server
-            sendData(self.socket, client_new_public_pem)
+            sendData(self.socket, public_key)
             log_event("Key Renewal", "Sent new public key to server.")
-
-            # Load the new private key
-            new_private_key = serialization.load_pem_private_key(
-                client_new_private_pem,
-                password=None,
-                backend=default_backend()
-            )
-            log_event("Key Renewal", "Loaded new private key.")
 
             # Receive the server's new public key
             server_new_public_pem = receiveData(self.socket)
@@ -334,8 +331,12 @@ class Client:
 
             # Derive the new session key
             context = b"session key derivation"
-            self.session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
+            self.session_key = Crypto.derive_session_key(server_new_public_key, private_key, context)
             log_event("Session", "New session key derived successfully.")
+
+            with self._lock:
+                self.private_key = private_key
+                self.server_public_key = server_new_public_key
 
         except Exception as e:
             log_event("Error", f"Handling key renewal response failed: {e}")
@@ -378,6 +379,8 @@ class Client:
             self.session_key = None
             self.server_public_key = None
             self.nonce_manager.cleanup_old_nonces()  # Add cleanup of nonces
+            self.certificate = None
+            self.server_certificate = None
             log_event("Session Termination", "Session terminated and resources cleaned up.")
 
     def start_listening(self):
@@ -406,3 +409,70 @@ class Client:
         if self.listen_thread:
             self.listen_thread.join()
         log_event("Listening", "Stopped listening for incoming messages.")
+
+    def _validate_server_certificate(self):
+        """
+        Validates the server's certificate including OCSP check.
+        
+        Raises:
+            ValueError: If certificate validation fails
+        """
+        try:
+            if not self.server_certificate:
+                raise ValueError("No server certificate available")
+
+            if not hasattr(self, 'tls_config') or not self.tls_config.ca_cert_path:
+                raise ValueError("No CA certificate configured")
+
+            # Load CA certificate
+            ca_cert = self.key_manager.load_certificate(self.tls_config.ca_cert_path)
+            
+            # Verify certificate chain
+            if not self.key_manager.verify_certificate(self.server_certificate, ca_cert):
+                raise ValueError("Server certificate verification failed")
+            log_event("Security", "Server certificate chain verified.")
+
+            # Check certificate revocation if enabled
+            if self.tls_config.check_ocsp:
+                if not self.key_manager.check_certificate_revocation(self.server_certificate, ca_cert):
+                    raise ValueError("Server certificate has been revoked")
+                log_event("Security", "Server certificate OCSP check passed.")
+
+            # Verify hostname
+            if self.tls_config.verify_peer:
+                self._verify_hostname(self.destination[0])
+                log_event("Security", "Server hostname verified.")
+
+        except Exception as e:
+            log_error(ErrorCode.AUTHENTICATION_ERROR, f"Certificate validation failed: {e}")
+            raise ValueError(f"Certificate validation failed: {e}")
+
+    def _verify_hostname(self, hostname):
+        """
+        Verifies the server's hostname against its certificate.
+        
+        Args:
+            hostname (str): The hostname to verify
+            
+        Raises:
+            ValueError: If hostname verification fails
+        """
+        try:
+            # Get the Subject Alternative Names extension
+            san_extension = self.server_certificate.extensions.get_extension_for_oid(
+                ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+            )
+            san_names = san_extension.value.get_values_for_type(x509.DNSName)
+            
+            # Check if hostname matches any SAN
+            if hostname not in san_names:
+                raise ValueError(f"Hostname {hostname} doesn't match certificate SANs")
+            
+        except x509.ExtensionNotFound:
+            # Fall back to Common Name in Subject if no SAN extension
+            common_name = self.server_certificate.subject.get_attributes_for_oid(
+                x509.NameOID.COMMON_NAME
+            )[0].value
+            
+            if hostname != common_name:
+                raise ValueError(f"Hostname {hostname} doesn't match certificate CN")

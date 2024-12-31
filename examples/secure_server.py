@@ -1,21 +1,19 @@
 from server.serverMain import Server
-from config.security_config import SecurityConfig, TLSConfig
-import os
-from pathlib import Path
+from config.security_config import SecurityConfig, TLSConfig, CertificateConfig
 
-def validate_cert_path(path: str) -> str:
-    """Validate certificate path exists and is readable"""
-    cert_path = os.getenv(path) or path
-    if not Path(cert_path).is_file():
-        raise ValueError(f"Certificate file not found: {cert_path}")
-    return cert_path
+# Create certificate configuration
+cert_config = CertificateConfig(
+    cert_path="/path/to/server.crt",
+    key_path="/path/to/server.key",
+    ca_cert_path="/path/to/ca.crt",
+    require_client_cert=True,
+    allowed_subjects=["client1", "client2"]
+)
 
-# Create TLS configuration with validated paths
+# Create TLS configuration
 tls_config = TLSConfig(
     enabled=True,
-    cert_path=validate_cert_path(os.getenv("SERVER_CERT_PATH", "/path/to/server.crt")),
-    key_path=validate_cert_path(os.getenv("SERVER_KEY_PATH", "/path/to/server.key")),
-    ca_cert_path=validate_cert_path(os.getenv("CA_CERT_PATH", "/path/to/ca.crt")),
+    cert_config=cert_config,
     verify_peer=True,
     check_ocsp=True
 )
@@ -26,6 +24,9 @@ security_config = SecurityConfig(
     enable_mutual_tls=True,
     cert_revocation_check=True
 )
+
+# Validate certificate paths
+security_config.validate_paths()
 
 # Create and start server
 server = Server(
