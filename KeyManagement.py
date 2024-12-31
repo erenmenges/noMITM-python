@@ -3,7 +3,7 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtensionOID
 import requests
 import time
 import threading
@@ -41,7 +41,7 @@ class KeyManagement:
     def check_certificate_revocation(certificate):
         try:
             ocsp_url = certificate.extensions.get_extension_for_oid(
-                NameOID.AUTHORITY_INFORMATION_ACCESS
+                ExtensionOID.AUTHORITY_INFORMATION_ACCESS
             ).value.access_descriptions[0].access_location.value
 
             ocsp_request = requests.get(ocsp_url)
