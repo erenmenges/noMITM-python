@@ -16,6 +16,8 @@ class Client:
         self.listening = False
         self.listen_thread = None
         self.destination = None
+        self.private_key = None  # Add attribute to store client's private key
+        self.public_key = None   # Add attribute to store client's public key
 
         # Schedule automated key renewal every 3600 seconds (1 hour)
         renewal_interval = 3600
@@ -65,7 +67,7 @@ class Client:
 
         # Load the client's private key
         try:
-            client_private_key = serialization.load_pem_private_key(
+            self.private_key = serialization.load_pem_private_key(
                 private_pem,
                 password=None,
                 backend=default_backend()
@@ -78,7 +80,7 @@ class Client:
         # Derive the shared session key using ECDH
         try:
             context = b"session key derivation"
-            self.session_key = Crypto.derive_session_key(server_public_key, client_private_key, context)
+            self.session_key = Crypto.derive_session_key(server_public_key, self.private_key, context)
             log_event("Session", "Session key derived successfully.")
         except Exception as e:
             log_event("Error", f"Failed to derive session key: {e}")
@@ -115,9 +117,28 @@ class Client:
         )
         log_event("Message Packaging", "Message packaged successfully.")
 
+        # Prepare the message for signing
+        message_bytes = message_package.encode('utf-8')
+
+        # Sign the message
+        signature = self.key_manager.sign_message(self.private_key, message_bytes)
+
+        # Update the message package with the signature
+        message_package_dict = {
+            "encryptedMessage": msg_dict['ciphertext'].hex(),
+            "nonce": msg_dict['nonce'].hex(),
+            "tag": msg_dict['tag'].hex(),
+            "timestamp": timestamp,
+            "type": "data",
+            "iv": msg_dict['nonce'].hex(),  # Using nonce as IV for AES-GCM
+            "signature": signature.hex()
+        }
+        message_package_signed = packageMessage(**message_package_dict)
+        log_event("Message Signing", "Message signed successfully.")
+
         try:
-            # Send the packaged message to the server
-            sendData(self.destination, message_package)
+            # Send the signed message to the server
+            sendData(self.destination, message_package_signed)
             log_event("Network", "Message sent to the server.")
         except Exception as e:
             # Log any errors encountered during message sending
@@ -174,6 +195,30 @@ class Client:
                         continue
                     if not self.nonce_manager.validate_timestamp(timestamp):
                         log_event("Security", "Invalid timestamp detected!")
+                        continue
+
+                    # Verify the message signature before decryption
+                    signature_hex = parsed_message.get("signature", "")
+                    if not signature_hex:
+                        log_event("Security", "No signature found in the message.")
+                        continue
+                    
+                    signature = bytes.fromhex(signature_hex)
+                    message_copy = packageMessage(
+                        encryptedMessage=parsed_message['encryptedMessage'],
+                        nonce=parsed_message['nonce'],
+                        tag=parsed_message['tag'],
+                        timestamp=parsed_message['timestamp'],
+                        type=parsed_message['type'],
+                        iv=parsed_message['iv']
+                    )
+                    signature_valid = self.key_manager.verify_signature(
+                        self.server_public_key,  # Assume server_public_key is stored after session establishment
+                        message_copy.encode('utf-8'),
+                        signature
+                    )
+                    if not signature_valid:
+                        log_event("Security", "Invalid message signature detected!")
                         continue
 
                     # Decrypt the message

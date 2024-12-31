@@ -6,6 +6,7 @@ import threading
 import socket
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
 
 class Server:
     def __init__(self, host="0.0.0.0", port=8080):
@@ -17,7 +18,8 @@ class Server:
         self.listen_thread = None
         self.host = host
         self.port = port
-        self.client_address = None  # To keep track of client address
+        self.private_key = None  # Add attribute to store server's private key
+        self.public_key = None   # Add attribute to store server's public key
 
         # Schedule automated key renewal every 3600 seconds (1 hour)
         renewal_interval = 3600
@@ -44,7 +46,6 @@ class Server:
             while self.listening:
                 try:
                     conn, addr = s.accept()
-                    self.client_address = addr
                     log_event("Connection", f"Connection established with {addr}.")
                     threading.Thread(target=self.handle_client, args=(conn, addr)).start()
                 except Exception as e:
@@ -73,16 +74,20 @@ class Server:
                 log_event("Key Exchange", "Client public key loaded successfully.")
 
                 # Load the server's private key
-                server_private_key = serialization.load_pem_private_key(
-                    server_private_pem,
-                    password=None,
-                    backend=default_backend()
-                )
-                log_event("Key Management", "Server private key loaded successfully.")
+                try:
+                    self.private_key = serialization.load_pem_private_key(
+                        server_private_pem,
+                        password=None,
+                        backend=default_backend()
+                    )
+                    log_event("Key Management", "Server private key loaded successfully.")
+                except Exception as e:
+                    log_event("Error", f"Failed to load server private key: {e}")
+                    return
 
                 # Derive the shared session key using ECDH
                 context = b"session key derivation"
-                self.session_key = Crypto.derive_session_key(client_public_key, server_private_key, context)
+                session_key = Crypto.derive_session_key(client_public_key, self.private_key, context)
                 log_event("Session", "Session key derived successfully.")
 
                 # Proceed to handle encrypted messages
@@ -103,7 +108,7 @@ class Server:
                     elif msg_type == "keyRenewalRequest":
                         # {{ edit_1 }} Handle key renewal request
                         log_event("Key Renewal", "Received key renewal request from client.")
-                        self.handle_key_renewal_request(conn)
+                        self.handle_key_renewal_request(conn, session_key, addr)
                         continue
 
                     elif msg_type == "sessionTermination":
@@ -123,6 +128,30 @@ class Server:
                             log_event("Security", "Invalid timestamp detected!")
                             continue
 
+                        # Verify the message signature before decryption
+                        signature_hex = parsed_message.get("signature", "")
+                        if not signature_hex:
+                            log_event("Security", "No signature found in the message.")
+                            continue
+                        
+                        signature = bytes.fromhex(signature_hex)
+                        message_copy = packageMessage(
+                            encryptedMessage=parsed_message['encryptedMessage'],
+                            nonce=parsed_message['nonce'],
+                            tag=parsed_message['tag'],
+                            timestamp=parsed_message['timestamp'],
+                            type=parsed_message['type'],
+                            iv=parsed_message['iv']
+                        )
+                        signature_valid = self.key_manager.verify_signature(
+                            client_public_key,  # Assume client_public_key is stored after session establishment
+                            message_copy.encode('utf-8'),
+                            signature
+                        )
+                        if not signature_valid:
+                            log_event("Security", "Invalid message signature detected!")
+                            continue
+
                         # Decrypt the message
                         ciphertext = bytes.fromhex(parsed_message['encryptedMessage']) + bytes.fromhex(parsed_message['tag'])
                         decrypted_message = Crypto.decrypt(
@@ -133,7 +162,7 @@ class Server:
                                 version=1,
                                 salt=b''  # Assuming salt is managed elsewhere
                             ),
-                            self.session_key
+                            session_key
                         )
 
                         log_event("Message", f"Decrypted message: {decrypted_message.decode('utf-8')}")
@@ -155,95 +184,98 @@ class Server:
             except Exception as e:
                 log_event("Error", f"Failed to process incoming message: {e}")
 
-        def handle_key_renewal_request(self, conn):
-            """
-            Handles the key renewal process by generating a new key pair and sending the new public key to the client.
-            """
-            try:
-                # Generate new key pair
-                new_public_pem, new_private_pem = Crypto.generate_key_pair()
-                log_event("Key Renewal", "Generated new key pair for renewal.")
+    def handle_key_renewal_request(self, conn, session_key, addr):
+        """
+        Handles the key renewal process by generating a new key pair and sending the new public key to the client.
+        """
+        try:
+            # Generate new key pair
+            new_public_pem, new_private_pem = Crypto.generate_key_pair()
+            log_event("Key Renewal", "Generated new key pair for renewal.")
 
-                # Send the new public key to the client
-                conn.sendall(new_public_pem)
-                log_event("Key Renewal", "Sent new public key to client.")
+            # Send the new public key to the client
+            conn.sendall(new_public_pem)
+            log_event("Key Renewal", "Sent new public key to client.")
 
-                # Load the new private key
-                new_private_key = serialization.load_pem_private_key(
-                    new_private_pem,
-                    password=None,
-                    backend=default_backend()
-                )
-                log_event("Key Renewal", "Loaded new private key.")
+            # Load the new private key
+            new_private_key = serialization.load_pem_private_key(
+                new_private_pem,
+                password=None,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Loaded new private key.")
 
-                # Assume client sends its new public key in response
-                client_new_public_pem = conn.recv(2048)
-                client_new_public_key = serialization.load_pem_public_key(
-                    client_new_public_pem,
-                    backend=default_backend()
-                )
-                log_event("Key Renewal", "Received new public key from client.")
+            # Assume client sends its new public key in response
+            client_new_public_pem = conn.recv(2048)
+            client_new_public_key = serialization.load_pem_public_key(
+                client_new_public_pem,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Received new public key from client.")
 
-                # Derive the new session key
-                context = b"session key derivation"
-                self.session_key = Crypto.derive_session_key(client_new_public_key, new_private_key, context)
-                log_event("Session", "New session key derived successfully.")
+            # Derive the new session key
+            context = b"session key derivation"
+            new_session_key = Crypto.derive_session_key(client_new_public_key, new_private_key, context)
+            log_event("Session", "New session key derived successfully.")
 
-                # Send key renewal response acknowledgment
-                renewal_ack = packageMessage(
-                    encryptedMessage='',
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=self.nonce_manager.get_current_timestamp(),
-                    type="keyRenewalResponse"
-                )
-                sendData(self.client_address, renewal_ack)
-                log_event("Key Renewal", "Sent key renewal acknowledgment to client.")
+            # Send key renewal response acknowledgment
+            renewal_ack = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=self.nonce_manager.get_current_timestamp(),
+                type="keyRenewalResponse"
+            )
+            conn.sendall(renewal_ack.encode('utf-8'))
+            log_event("Key Renewal", "Sent key renewal acknowledgment to client.")
 
-            except Exception as e:
-                log_event("Error", f"Key renewal failed: {e}")
+            # Update the session key locally if needed
+            session_key = new_session_key
 
-        def request_key_renewal(self, conn, addr):
-            """
-            Initiates the key renewal process by sending a key renewal request to the client.
-            """
-            try:
-                # Send key renewal request
-                key_renewal_request = packageMessage(
-                    encryptedMessage='',
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=self.nonce_manager.get_current_timestamp(),
-                    type="keyRenewalRequest"
-                )
-                sendData(addr, key_renewal_request)
-                log_event("Key Renewal", "Sent key renewal request to client.")
-            except Exception as e:
-                log_event("Error", f"Failed to send key renewal request: {e}")
+        except Exception as e:
+            log_event("Error", f"Key renewal failed: {e}")
 
-        def terminate_session(self, conn, addr):
-            """
-            Terminates the session by notifying the client and closing the connection.
-            """
-            try:
-                termination_message = packageMessage(
-                    encryptedMessage='',
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=self.nonce_manager.get_current_timestamp(),
-                    type="sessionTermination"
-                )
-                sendData(addr, termination_message)
-                log_event("Session Termination", "Sent session termination message to client.")
-            except Exception as e:
-                log_event("Error", f"Failed to send session termination message: {e}")
-            finally:
-                conn.close()
-                log_event("Session Termination", "Session terminated and connection closed.")
+    def request_key_renewal(self, conn, addr):
+        """
+        Initiates the key renewal process by sending a key renewal request to the client.
+        """
+        try:
+            # Send key renewal request
+            key_renewal_request = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=self.nonce_manager.get_current_timestamp(),
+                type="keyRenewalRequest"
+            )
+            sendData(addr, key_renewal_request)
+            log_event("Key Renewal", "Sent key renewal request to client.")
+        except Exception as e:
+            log_event("Error", f"Failed to send key renewal request: {e}")
+
+    def terminate_session(self, conn, addr):
+        """
+        Terminates the session by notifying the client and closing the connection.
+        """
+        try:
+            termination_message = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=self.nonce_manager.get_current_timestamp(),
+                type="sessionTermination"
+            )
+            conn.sendall(termination_message.encode('utf-8'))
+            log_event("Session Termination", "Sent session termination message to client.")
+        except Exception as e:
+            log_event("Error", f"Failed to send session termination message: {e}")
+        finally:
+            conn.close()
+            log_event("Session Termination", "Session terminated and connection closed.")
 
     def send_message(self, conn, addr, message):
         """
-        Sends a message to the connected client.
+        Sends a signed message to the connected client.
         
         Args:
             message (str): The message to send.
@@ -259,21 +291,34 @@ class Server:
         iv, encrypted_message = Crypto.aes_encrypt(message.encode('utf-8'), self.session_key)
 
         # Create a hash of the encrypted message to ensure integrity
-        message_hash = Crypto.hash(encrypted_message)
-        # Package the encrypted message with metadata into a JSON structure
-        message_package = packageMessage(
+        message_bytes = packageMessage(
             encryptedMessage=encrypted_message.hex(),
-            signature=message_hash.hex(),
             nonce=nonce,
+            tag=hashes.SHA256().finalize(),  # Placeholder for actual tag
             timestamp=timestamp,
             type="serverMessage",
             iv=iv.hex()
-        )
-        log_event("Message Packaging", "Server message packaged successfully.")
+        ).encode('utf-8')
+
+        # Sign the message
+        signature = self.key_manager.sign_message(self.private_key, message_bytes)
+
+        # Create the final message package with signature
+        message_package_dict = {
+            "encryptedMessage": encrypted_message.hex(),
+            "nonce": nonce,
+            "tag": hash.hex(),  # Replace with actual tag if different
+            "timestamp": timestamp,
+            "type": "serverMessage",
+            "iv": iv.hex(),
+            "signature": signature.hex()
+        }
+        message_package_signed = packageMessage(**message_package_dict)
+        log_event("Message Signing", "Server message signed successfully.")
 
         try:
-            # Send the packaged message to the client
-            sendData(addr, message_package)
+            # Send the signed message to the client
+            sendData(addr, message_package_signed)
             log_event("Network", "Server message sent to client.")
         except Exception as e:
             # Log any errors encountered during message sending
