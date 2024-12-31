@@ -3,9 +3,10 @@ import socket
 from Communications import packageMessage, parseMessage, sendData, receiveData
 from Crypto import Crypto, SecureMessage
 from KeyManagement import KeyManagement
-from Utils import NonceManager, log_event
+from Utils import NonceManager, log_event, log_error, ErrorCode, ErrorMessage
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from security.TLSWrapper import TLSWrapper
 
 class Client:
     def __init__(self):
@@ -28,6 +29,7 @@ class Client:
     def set_session_key(self, key):
         with self._lock:
             self.session_key = key
+            log_event("Session", "Session key updated")
 
     def establish_session(self, destination):
         """
@@ -36,32 +38,46 @@ class Client:
         Args:
             destination (tuple): A tuple containing the server's IP and port.
         """
-        self.destination = destination
-
-        # Generate the client's key pair for secure communication
-        public_pem, private_pem = Crypto.generate_key_pair()
-        log_event("Key Generation", "Client key pair generated.")
-
-        # Connect to the server and store the socket
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(30)  # 30 second timeout
-            self.socket.connect(destination)
-            log_event("Network", f"Connected to server at {destination}.")
-
-            # Send the client's public key to the server
-            self.socket.sendall(public_pem)
-            log_event("Key Exchange", "Sent public key to server.")
-
-            # Receive the server's public key
-            server_public_pem = self.socket.recv(2048)
-            log_event("Key Exchange", "Received public key from server.")
-
-        except Exception as e:
-            log_event("Error", f"Failed to establish connection: {e}")
+        with self._lock:
             if self.socket:
-                self.socket.close()
-            return
+                self.terminate_session()
+            
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(30)
+
+                # If TLS is enabled, wrap the socket
+                if hasattr(self, 'tls_config') and self.tls_config.enabled:
+                    tls_wrapper = TLSWrapper(self.tls_config)
+                    self.socket = tls_wrapper.wrap_socket(
+                        self.socket,
+                        server_side=False,
+                        server_hostname=destination[0]
+                    )
+                    log_event("Security", "TLS connection established.")
+
+                self.socket.connect(destination)
+                log_event("Network", f"Connected to server at {destination}.")
+
+                # Continue with existing key exchange logic
+                # Generate the client's key pair for secure communication
+                public_pem, private_pem = Crypto.generate_key_pair()
+                log_event("Key Generation", "Client key pair generated.")
+
+                # Send the client's public key to the server
+                self.socket.sendall(public_pem)
+                log_event("Key Exchange", "Sent public key to server.")
+
+                # Receive the server's public key
+                server_public_pem = self.socket.recv(2048)
+                log_event("Key Exchange", "Received public key from server.")
+
+            except Exception as e:
+                if self.socket:
+                    self.socket.close()
+                    self.socket = None
+                log_error(ErrorCode.NETWORK_ERROR, f"Failed to establish session: {e}")
+                raise
 
         # Load the server's public key
         try:
@@ -73,7 +89,8 @@ class Client:
             self.server_public_key = server_public_key
         except Exception as e:
             log_event("Error", f"Failed to load server public key: {e}")
-            return
+            self.terminate_session()
+            return False
 
         # Load the client's private key
         try:
@@ -95,6 +112,8 @@ class Client:
         except Exception as e:
             log_event("Error", f"Failed to derive session key: {e}")
             return
+
+        return True
 
     def send_message(self, message):
         """
@@ -327,22 +346,22 @@ class Client:
         Terminates the session by notifying the server and cleaning up resources.
         """
         try:
-            if self.socket and self.socket.fileno() != -1:  # Check if socket is still valid
-                # Send session termination message to server
-                termination_message = packageMessage(
-                    encryptedMessage='',
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=self.nonce_manager.get_current_timestamp(),
-                    type="sessionTermination"
-                )
+            if self.socket and self.socket.fileno() != -1:
+                # Send termination message
                 try:
+                    termination_message = packageMessage(
+                        encryptedMessage='',
+                        signature='',
+                        nonce=self.nonce_manager.generate_nonce(),
+                        timestamp=self.nonce_manager.get_current_timestamp(),
+                        type=MessageType.SESSION_TERMINATION  # Use enum instead of string
+                    )
                     sendData(self.socket, termination_message)
-                    log_event("Session Termination", "Sent session termination message to server.")
+                    log_event("Session Termination", "Sent termination message to server.")
                 except Exception as e:
                     log_event("Warning", f"Could not send termination message: {e}")
         except Exception as e:
-            log_event("Error", f"Error during session termination: {e}")
+            log_error(ErrorCode.SESSION_ERROR, f"Error during session termination: {e}")
         finally:
             # Ensure all resources are cleaned up
             self.stop_listening()
@@ -350,14 +369,15 @@ class Client:
                 try:
                     self.socket.shutdown(socket.SHUT_RDWR)
                 except Exception:
-                    pass  # Socket might already be closed
+                    pass
                 try:
                     self.socket.close()
                 except Exception:
                     pass
                 self.socket = None
             self.session_key = None
-            self.server_public_key = None  # Also clean up keys
+            self.server_public_key = None
+            self.nonce_manager.cleanup_old_nonces()  # Add cleanup of nonces
             log_event("Session Termination", "Session terminated and resources cleaned up.")
 
     def start_listening(self):

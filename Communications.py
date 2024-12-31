@@ -1,7 +1,7 @@
 import json
 import socket
 import time
-from Utils import log_event
+from Utils import ErrorCode, log_error, log_event, ErrorMessage
 import threading
 from enum import Enum, auto
 
@@ -75,49 +75,33 @@ def packageMessage(encryptedMessage, signature, nonce, timestamp, type=MessageTy
     return json.dumps(message_package)
 
 def validate_message_data(data: dict) -> bool:
-    """
-    Validate message data structure and content.
-    
-    Args:
-        data: Dictionary containing message data
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    required_fields = {
-        'sequence': int,
-        'encryptedMessage': str,
-        'signature': str,
-        'nonce': str,
-        'timestamp': (int, float),
-        'type': str,
-        'iv': str
-    }
-    
+    """Validate message data structure and content with improved security checks."""
     try:
+        # Required fields and their types
+        required_fields = {
+            'sequence': (int, lambda x: 0 <= x < 2**32),
+            'encryptedMessage': (str, lambda x: len(x) > 0),
+            'signature': (str, lambda x: len(x) > 0),
+            'nonce': (str, lambda x: len(x) == 32),  # Expect 32-byte nonce in hex
+            'timestamp': (int, lambda x: time.time() - 300 <= x <= time.time() + 300),  # ±5 min window
+            'type': (str, lambda x: validate_message_type(x)),
+        }
+        
         # Check all required fields exist and have correct types
-        for field, field_type in required_fields.items():
+        for field, (field_type, validator) in required_fields.items():
             if field not in data:
-                log_event("Validation", f"Missing required field: {field}")
+                log_error(ErrorCode.VALIDATION_ERROR, f"Missing required field: {field}")
                 return False
             if not isinstance(data[field], field_type):
-                log_event("Validation", f"Invalid type for field {field}")
+                log_error(ErrorCode.VALIDATION_ERROR, f"Invalid type for field {field}")
+                return False
+            if not validator(data[field]):
+                log_error(ErrorCode.VALIDATION_ERROR, f"Validation failed for field {field}")
                 return False
                 
-        # Validate message size
-        if len(data['encryptedMessage']) > MAX_MESSAGE_SIZE:
-            log_event("Validation", "Message size exceeds maximum allowed")
-            return False
-            
-        # Validate message type
-        if not validate_message_type(data['type']):
-            log_event("Validation", f"Invalid message type: {data['type']}")
-            return False
-            
         return True
-        
     except Exception as e:
-        log_event("Error", f"Message validation failed: {e}")
+        log_error(ErrorCode.VALIDATION_ERROR, f"Message validation failed: {e}")
         return False
 
 def parseMessage(package):
@@ -166,29 +150,44 @@ def sendData(conn, data):
             raise ValueError(f"Message size exceeds maximum allowed size of {MAX_MESSAGE_SIZE} bytes")
         conn.sendall(data)
     except socket.error as e:
-        log_event("Error", f"Failed to send data: {e}")
+        log_error(ErrorCode.NETWORK_ERROR, f"Failed to send data: {e}")
+        raise
+    except Exception as e:
+        log_error(ErrorCode.GENERAL_ERROR, f"Unexpected error while sending data: {e}")
         raise
 
-def receiveData(conn):
-    """
-    Receives data over an existing socket connection.
-    
-    Args:
-        conn (socket.socket): The connected socket object.
-    
-    Returns:
-        str: The received data.
-    """
+def receiveData(conn, timeout=30, max_size=1024*1024):
+    """Receives data with proper timeout and size limits."""
     try:
         chunks = []
-        while True:
-            chunk = conn.recv(1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
+        total_size = 0
+        conn.settimeout(timeout)
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                chunk = conn.recv(4096)  # Increased buffer size for efficiency
+                if not chunk:
+                    if not chunks:
+                        raise ConnectionError("Connection closed by peer")
+                    break
+                    
+                total_size += len(chunk)
+                if total_size > max_size:
+                    raise ValueError(f"Message size exceeds maximum allowed size of {max_size} bytes")
+                    
+                chunks.append(chunk)
+            except socket.timeout:
+                if chunks:  # If we have partial data
+                    break
+                continue
+                
+        if not chunks:
+            raise TimeoutError("No data received within timeout period")
+            
         return b''.join(chunks).decode('utf-8')
     except Exception as e:
-        log_event("Error", f"Failed to receive data: {e}")
+        log_error(ErrorCode.NETWORK_ERROR, f"Failed to receive data: {e}")
         raise
 
 # Key Renewal Messages

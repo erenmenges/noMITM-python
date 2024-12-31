@@ -8,23 +8,36 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 import time
+from security.TLSWrapper import TLSWrapper
 
 class Server:
-    def __init__(self, host='localhost', port=5000):
+    def __init__(self, host='localhost', port=5000, tls_config=None):
         self.host = host
         self.port = port
         self.server_socket = None
+        self._clients_lock = threading.RLock()  # Add thread lock
         self.clients = {}  # Store client connections
         self.running = False
         self.connection_timeout = 30  # 30 seconds timeout
         self.key_manager = KeyManagement()
         self.nonce_manager = NonceManager()
+        self.tls_config = tls_config
+        self.tls_wrapper = TLSWrapper(tls_config) if tls_config and tls_config.enabled else None
 
     def start(self):
         """Start the server and listen for connections."""
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # If TLS is enabled, wrap the server socket
+            if self.tls_wrapper:
+                self.server_socket = self.tls_wrapper.wrap_socket(
+                    self.server_socket,
+                    server_side=True
+                )
+                log_event("Security", "TLS enabled on server socket.")
+
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
             self.running = True
@@ -68,24 +81,26 @@ class Server:
         current_time = time.time()
         inactive_clients = []
         
-        for client_id, client_data in self.clients.items():
-            if current_time - client_data['last_activity'] > self.connection_timeout:
-                inactive_clients.append(client_id)
-                
-        for client_id in inactive_clients:
-            self.close_client_connection(client_id)
+        with self._clients_lock:  # Add thread safety
+            for client_id, client_data in self.clients.items():
+                if current_time - client_data['last_activity'] > self.connection_timeout:
+                    inactive_clients.append(client_id)
+                    
+            for client_id in inactive_clients:
+                self.close_client_connection(client_id)
 
     def close_client_connection(self, client_id):
         """Safely close a client connection."""
-        if client_id in self.clients:
-            try:
-                conn = self.clients[client_id]['connection']
-                conn.shutdown(socket.SHUT_RDWR)
-                conn.close()
-            except Exception as e:
-                log_error(ErrorCode.NETWORK_ERROR, f"Error closing client connection: {e}")
-            finally:
-                del self.clients[client_id]
+        with self._clients_lock:  # Add thread safety
+            if client_id in self.clients:
+                try:
+                    conn = self.clients[client_id]['connection']
+                    conn.shutdown(socket.SHUT_RDWR)
+                    conn.close()
+                except Exception as e:
+                    log_error(ErrorCode.NETWORK_ERROR, f"Error closing client connection: {e}")
+                finally:
+                    del self.clients[client_id]
 
     def shutdown(self):
         """Shutdown the server and cleanup all resources."""
@@ -134,3 +149,50 @@ class Server:
         self.nonce_manager.cleanup_old_nonces()
         
         log_event("Server", "Server shutdown complete")
+
+    def handle_client(self, conn, addr, client_id):
+        """Handle client connection with proper resource management."""
+        try:
+            conn.settimeout(self.connection_timeout)
+            
+            # Initialize client session
+            with self._clients_lock:
+                if client_id in self.clients:
+                    # Duplicate connection, close old one
+                    self.close_client_connection(client_id)
+                
+                self.clients[client_id] = {
+                    'connection': conn,
+                    'address': addr,
+                    'last_activity': time.time(),
+                    'session_established': False
+                }
+            
+            while self.running:
+                try:
+                    data = receiveData(conn)
+                    if not data:
+                        break
+                    
+                    # Update last activity timestamp
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            self.clients[client_id]['last_activity'] = time.time()
+                        else:
+                            break
+                    
+                    # Process message
+                    self.process_client_message(data, client_id)
+                    
+                except socket.timeout:
+                    continue
+                except ConnectionError:
+                    break
+                except Exception as e:
+                    log_error(ErrorCode.GENERAL_ERROR, f"Error handling client message: {e}")
+                    break
+        finally:
+            # Ensure cleanup happens
+            with self._clients_lock:
+                if client_id in self.clients:
+                    self.close_client_connection(client_id)

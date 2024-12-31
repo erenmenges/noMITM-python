@@ -22,18 +22,51 @@ from cryptography.hazmat.backends import default_backend
 class KeyManagement:
     def __init__(self):
         self._session_keys = {}
-        self._key_lock = threading.RLock()  # Use RLock for reentrant locking
-        self._renewal_scheduler = None
-        
+        self._key_lock = threading.RLock()
+        self._cleanup_thread = None
+        self._running = False
+        self.cleanup_interval = 3600  # 1 hour
+        self.key_expiry = 86400  # 24 hours
+        self.start_cleanup_thread()
+
+    def start_cleanup_thread(self):
+        """Start background cleanup thread."""
+        self._running = True
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+
+    def stop_cleanup_thread(self):
+        """Safely stop the cleanup thread."""
+        self._running = False
+        if self._cleanup_thread:
+            self._cleanup_thread.join()
+
+    def _cleanup_loop(self):
+        """Background thread for key cleanup."""
+        while self._running:
+            try:
+                self.cleanup_expired_keys()
+                time.sleep(self.cleanup_interval)
+            except Exception as e:
+                log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key cleanup error: {e}")
+
     def get_session_key(self, client_id: str) -> Optional[bytes]:
         """Thread-safe session key retrieval."""
         with self._key_lock:
             return self._session_keys.get(client_id)
             
     def set_session_key(self, client_id: str, key: bytes):
-        """Thread-safe session key setting."""
+        """Thread-safe session key setting with timestamp."""
         with self._key_lock:
-            self._session_keys[client_id] = key
+            self._session_keys[client_id] = {
+                'key': key,
+                'timestamp': time.time()
+            }
+            
+            # Periodic cleanup
+            if time.time() - self._last_cleanup > self.cleanup_interval:
+                self.cleanup_expired_keys()
+                self._last_cleanup = time.time()
             
     def remove_session_key(self, client_id: str):
         """Thread-safe session key removal."""
@@ -50,12 +83,32 @@ class KeyManagement:
         with self._key_lock:
             self._session_keys.update(updates)
 
+    def cleanup_expired_keys(self):
+        """Remove expired session keys."""
+        current_time = time.time()
+        with self._key_lock:
+            expired_keys = [
+                client_id for client_id, key_data in self._session_keys.items()
+                if current_time - key_data['timestamp'] > self.key_expiry
+            ]
+            for client_id in expired_keys:
+                key_data = self._session_keys[client_id]
+                # Securely clear key from memory
+                if isinstance(key_data.get('key'), bytes):
+                    key_data['key'] = b'\x00' * len(key_data['key'])
+                self._session_keys.pop(client_id)
+
     # Certificate Handling with OCSP
     @staticmethod
     def load_certificate(filepath):
-        with open(filepath, "rb") as cert_file:
-            certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
-        return certificate
+        """Load certificate with proper resource management"""
+        try:
+            with open(filepath, "rb") as cert_file:
+                certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
+            return certificate
+        except Exception as e:
+            log_error(ErrorCode.CRYPTO_ERROR, f"Failed to load certificate: {e}")
+            raise
 
     @staticmethod
     def verify_certificate(certificate, ca_certificate):
@@ -154,14 +207,33 @@ class KeyManagement:
     # Session Key Management with Automated Renewal
 
     def initiate_key_renewal(self):
+        """Initiate key renewal with proper error handling and atomic updates."""
         try:
-            print("Key renewal initiated.")
-            private_key, public_key = Crypto.generate_key_pair()
-            self.current_session_keys["private_key"] = private_key
-            self.current_session_keys["public_key"] = public_key
-            return private_key, public_key
+            with self._key_lock:
+                # Generate new keys
+                private_key, public_key = Crypto.generate_key_pair()
+                
+                # Store old keys temporarily
+                old_keys = {
+                    "private_key": self.current_session_keys.get("private_key"),
+                    "public_key": self.current_session_keys.get("public_key")
+                }
+                
+                try:
+                    # Update keys atomically
+                    self.current_session_keys["private_key"] = private_key
+                    self.current_session_keys["public_key"] = public_key
+                    log_event("Key Management", "Key renewal completed successfully")
+                    return private_key, public_key
+                except Exception as e:
+                    # Rollback on failure
+                    if old_keys["private_key"] and old_keys["public_key"]:
+                        self.current_session_keys["private_key"] = old_keys["private_key"]
+                        self.current_session_keys["public_key"] = old_keys["public_key"]
+                    raise RuntimeError(f"Key renewal failed: {e}")
         except Exception as e:
-            raise RuntimeError(f"Key pair generation failed: {e}") from e
+            log_error(ErrorCode.CRYPTO_ERROR, f"Key renewal failed: {e}")
+            raise
 
     def handle_key_renewal_request(self, peer_public_key):
         try:

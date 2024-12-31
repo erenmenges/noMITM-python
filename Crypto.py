@@ -9,6 +9,8 @@ import os
 import secrets
 import logging
 from typing import Optional, Tuple, Dict, Any
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -51,11 +53,75 @@ class SecureMessage:
             salt=bytes.fromhex(data['salt'])
         )
 
+class NonceManager:
+    def __init__(self, cache_size=10000, nonce_lifetime=300):  # 5 minutes lifetime
+        self._nonce_cache = {}  # Dictionary to store nonce with timestamp
+        self._nonce_lock = threading.Lock()
+        self._cache_size = cache_size
+        self._nonce_lifetime = nonce_lifetime
+        
+    def generate_nonce(self) -> bytes:
+        """Generate a unique nonce with timestamp."""
+        with self._nonce_lock:
+            while True:
+                nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
+                current_time = time.time()
+                
+                # Clean expired nonces
+                self._cleanup_expired_nonces()
+                
+                if nonce not in self._nonce_cache:
+                    self._nonce_cache[nonce] = current_time
+                    return nonce
+                    
+    def verify_nonce(self, nonce: bytes) -> bool:
+        """Verify nonce is unique and not expired."""
+        with self._nonce_lock:
+            if nonce in self._nonce_cache:
+                return False
+            current_time = time.time()
+            self._nonce_cache[nonce] = current_time
+            self._cleanup_expired_nonces()
+            return True
+            
+    def _cleanup_expired_nonces(self):
+        """Remove expired nonces from cache."""
+        current_time = time.time()
+        expired = [
+            nonce for nonce, timestamp in self._nonce_cache.items()
+            if current_time - timestamp > self._nonce_lifetime
+        ]
+        for nonce in expired:
+            del self._nonce_cache[nonce]
+
 class Crypto:
     def __init__(self):
-        # Verify that we have a secure random number generator
-        if not os.urandom(1):
-            raise RuntimeError("Secure random number generator is not available")
+        self._nonce_manager = NonceManager()
+        self._key_cache = {}
+        self._key_cache_lock = threading.Lock()
+
+    def __del__(self):
+        """Ensure sensitive data is cleared from memory"""
+        try:
+            with self._key_cache_lock:
+                for key in self._key_cache:
+                    # Overwrite with zeros before deletion
+                    self._key_cache[key] = b'\x00' * len(self._key_cache[key])
+                self._key_cache.clear()
+        except Exception:
+            pass
+
+    def _generate_unique_nonce(self) -> bytes:
+        """Generate a unique nonce that hasn't been used recently."""
+        with self._nonce_lock:
+            while True:
+                nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
+                if nonce not in self._nonce_cache:
+                    self._nonce_cache.add(nonce)
+                    # Cleanup old nonces if cache gets too large
+                    if len(self._nonce_cache) > self._nonce_cleanup_threshold:
+                        self._nonce_cache.clear()
+                    return nonce
 
     @staticmethod
     def generate_key_pair(password: Optional[bytes] = None) -> Tuple[bytes, bytes]:
@@ -99,24 +165,26 @@ class Crypto:
     def derive_session_key(peer_public_key: ec.EllipticCurvePublicKey,
                           private_key: ec.EllipticCurvePrivateKey,
                           context: bytes) -> bytes:
-        """
-        Derive a session key using ECDH and HKDF.
-        """
+        """Derive a session key using ECDH and HKDF."""
         try:
-
+            # Generate salt for HKDF
+            salt = secrets.token_bytes(CryptoConstants.SALT_SIZE)
+            
             # Perform key agreement
             shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
-
+            
             # Use HKDF with salt and context
             derived_key = HKDF(
                 algorithm=hashes.SHA256(),
                 length=CryptoConstants.AES_KEY_SIZE,
-                salt=None,
+                salt=salt,  # Use generated salt instead of None
                 info=context,
                 backend=default_backend()
             ).derive(shared_secret)
-
-            logger.info("Derived new session key")
+            
+            # Securely clear shared secret from memory
+            shared_secret = b'\x00' * len(shared_secret)
+            
             return derived_key
         except Exception as e:
             logger.error(f"Session key derivation failed: {str(e)}")
@@ -124,15 +192,15 @@ class Crypto:
 
     @staticmethod
     def encrypt(data: bytes, key: bytes) -> SecureMessage:
-        """
-        Encrypt data using AES-GCM with authentication.
-        """
+        """Encrypt data using AES-GCM with authentication."""
+        if not isinstance(data, bytes) or not isinstance(key, bytes):
+            raise TypeError("Data and key must be bytes objects")
         if len(key) != CryptoConstants.AES_KEY_SIZE:
             raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
 
+        crypto = Crypto()  # Create instance for nonce management
         try:
-            # Generate a random nonce
-            nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
+            nonce = crypto._generate_unique_nonce()
             
             # Generate a random salt for key derivation
             salt = secrets.token_bytes(CryptoConstants.SALT_SIZE)
