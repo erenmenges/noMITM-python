@@ -1,7 +1,7 @@
 import threading
 import socket
 from Communications import packageMessage, parseMessage, sendData, receiveData
-from Crypto import Crypto
+from Crypto import Crypto, SecureMessage
 from KeyManagement import KeyManagement
 from Utils import NonceManager, log_event
 from cryptography.hazmat.primitives import serialization
@@ -141,33 +141,165 @@ class Client:
                 parsed_message = parseMessage(received_package)
                 log_event("Network", "Message received from server.")
 
-                # Validate nonce and timestamp
-                nonce = bytes.fromhex(parsed_message['nonce'])
-                timestamp = parsed_message['timestamp']
-                if not self.nonce_manager.validate_nonce(nonce.decode('utf-8')):
-                    log_event("Security", "Invalid nonce detected!")
-                    continue
-                if not self.nonce_manager.validate_timestamp(timestamp):
-                    log_event("Security", "Invalid timestamp detected!")
+                msg_type = parsed_message.get("type", "data")
+
+                if msg_type == "acknowledge":
+                    log_event("Network", "Acknowledgment received from server.")
                     continue
 
-                # Decrypt the message
-                ciphertext = bytes.fromhex(parsed_message['encryptedMessage']) + bytes.fromhex(parsed_message['tag'])
-                decrypted_message = Crypto.decrypt(
-                    SecureMessage(
-                        ciphertext=ciphertext[:-16],
-                        nonce=bytes.fromhex(parsed_message['nonce']),
-                        tag=ciphertext[-16:],
-                        version=1,
-                        salt=b''  # Assuming salt is managed elsewhere
-                    ),
-                    self.session_key
-                )
+                elif msg_type == "keyRenewalRequest":
+                    # {{ edit_1 }} Handle key renewal request
+                    log_event("Key Renewal", "Received key renewal request from server.")
+                    self.handle_key_renewal_request()
+                    continue
 
-                log_event("Message", f"Decrypted message: {decrypted_message.decode('utf-8')}")
-            
+                elif msg_type == "keyRenewalResponse":
+                    # {{ edit_2 }} Handle key renewal response
+                    log_event("Key Renewal", "Received key renewal response from server.")
+                    self.handle_key_renewal_response()
+                    continue
+
+                elif msg_type == "sessionTermination":
+                    # {{ edit_3 }} Handle session termination request
+                    log_event("Session Termination", "Received session termination request from server.")
+                    self.terminate_session()
+                    break
+
+                elif msg_type == "data":
+                    # Validate nonce and timestamp
+                    nonce = bytes.fromhex(parsed_message['nonce'])
+                    timestamp = parsed_message['timestamp']
+                    if not self.nonce_manager.validate_nonce(nonce.decode('utf-8')):
+                        log_event("Security", "Invalid nonce detected!")
+                        continue
+                    if not self.nonce_manager.validate_timestamp(timestamp):
+                        log_event("Security", "Invalid timestamp detected!")
+                        continue
+
+                    # Decrypt the message
+                    ciphertext = bytes.fromhex(parsed_message['encryptedMessage']) + bytes.fromhex(parsed_message['tag'])
+                    decrypted_message = Crypto.decrypt(
+                        SecureMessage(
+                            ciphertext=ciphertext[:-16],
+                            nonce=bytes.fromhex(parsed_message['nonce']),
+                            tag=ciphertext[-16:],
+                            version=1,
+                            salt=b''  # Assuming salt is managed elsewhere
+                        ),
+                        self.session_key
+                    )
+
+                    log_event("Message", f"Decrypted message: {decrypted_message.decode('utf-8')}")
+                
             except Exception as e:
                 log_event("Error", f"Failed to receive or decrypt message: {e}")
+
+    def handle_key_renewal_request(self):
+        """
+        Handles the key renewal process by generating a new key pair and sending the new public key to the server.
+        """
+        try:
+            # Generate new key pair
+            new_public_pem, new_private_pem = Crypto.generate_key_pair()
+            log_event("Key Renewal", "Generated new key pair for renewal.")
+
+            # Send the new public key to the server
+            sendData(self.destination, new_public_pem)
+            log_event("Key Renewal", "Sent new public key to server.")
+
+            # Load the new private key
+            new_private_key = serialization.load_pem_private_key(
+                new_private_pem,
+                password=None,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Loaded new private key.")
+
+            # Assume server sends its new public key in response
+            server_new_public_pem = receiveData()
+            server_new_public_key = serialization.load_pem_public_key(
+                server_new_public_pem,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Received new public key from server.")
+
+            # Derive the new session key
+            context = b"session key derivation"
+            self.session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
+            log_event("Session", "New session key derived successfully.")
+
+            # Send key renewal response acknowledgment
+            renewal_ack = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=self.nonce_manager.get_current_timestamp(),
+                type="keyRenewalResponse"
+            )
+            sendData(self.destination, renewal_ack)
+            log_event("Key Renewal", "Sent key renewal acknowledgment to server.")
+
+        except Exception as e:
+            log_event("Error", f"Key renewal failed: {e}")
+
+    def handle_key_renewal_response(self):
+        """
+        Handles the key renewal response from the server by deriving the new session key.
+        """
+        try:
+            # Assume client sends its new public key in response
+            client_new_public_pem, client_new_private_pem = Crypto.generate_key_pair()
+            log_event("Key Renewal", "Generated new key pair for renewal.")
+
+            # Send the new public key to the server
+            sendData(self.destination, client_new_public_pem)
+            log_event("Key Renewal", "Sent new public key to server.")
+
+            # Load the new private key
+            new_private_key = serialization.load_pem_private_key(
+                client_new_private_pem,
+                password=None,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Loaded new private key.")
+
+            # Receive the server's new public key
+            server_new_public_pem = receiveData()
+            server_new_public_key = serialization.load_pem_public_key(
+                server_new_public_pem,
+                backend=default_backend()
+            )
+            log_event("Key Renewal", "Received new public key from server.")
+
+            # Derive the new session key
+            context = b"session key derivation"
+            self.session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
+            log_event("Session", "New session key derived successfully.")
+
+        except Exception as e:
+            log_event("Error", f"Handling key renewal response failed: {e}")
+
+    def terminate_session(self):
+        """
+        Terminates the session by notifying the server and cleaning up resources.
+        """
+        try:
+            # Send session termination message to server
+            termination_message = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=self.nonce_manager.get_current_timestamp(),
+                type="sessionTermination"
+            )
+            sendData(self.destination, termination_message)
+            log_event("Session Termination", "Sent session termination message to server.")
+        except Exception as e:
+            log_event("Error", f"Failed to send session termination message: {e}")
+        finally:
+            self.stop_listening()
+            self.session_key = None
+            log_event("Session Termination", "Session terminated successfully.")
 
     def start_listening(self):
         """

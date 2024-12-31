@@ -1,5 +1,5 @@
 from Communications import packageMessage, parseMessage, sendData, receiveData
-from Crypto import Crypto
+from Crypto import Crypto, SecureMessage
 from KeyManagement import KeyManagement
 from Utils import NonceManager, log_event
 import threading
@@ -94,14 +94,25 @@ class Server:
                     parsed_message = parseMessage(received_package.decode('utf-8'))
                     log_event("Network", "Message received from client.")
 
-                    # Handle acknowledgment
-                    if parsed_message.get("type") == "acknowledge":
+                    msg_type = parsed_message.get("type", "data")
+
+                    if msg_type == "acknowledge":
                         log_event("Network", "Acknowledgment received from client.")
                         continue
 
-                    msg_type = parsed_message.get("type", "data")
+                    elif msg_type == "keyRenewalRequest":
+                        # {{ edit_1 }} Handle key renewal request
+                        log_event("Key Renewal", "Received key renewal request from client.")
+                        self.handle_key_renewal_request(conn)
+                        continue
 
-                    if msg_type == "data":
+                    elif msg_type == "sessionTermination":
+                        # {{ edit_2 }} Handle session termination request
+                        log_event("Session Termination", "Received session termination request from client.")
+                        self.terminate_session(conn, addr)
+                        break
+
+                    elif msg_type == "data":
                         # Validate nonce and timestamp
                         nonce = parsed_message['nonce']
                         timestamp = parsed_message['timestamp']
@@ -139,12 +150,98 @@ class Server:
                         log_event("Network", "Acknowledgment sent to client.")
 
                         # Server sends its own message to client
-                        self.send_message("Hello from server!")
+                        self.send_message(conn, addr, "Hello from server!")
 
             except Exception as e:
                 log_event("Error", f"Failed to process incoming message: {e}")
 
-    def send_message(self, message):
+        def handle_key_renewal_request(self, conn):
+            """
+            Handles the key renewal process by generating a new key pair and sending the new public key to the client.
+            """
+            try:
+                # Generate new key pair
+                new_public_pem, new_private_pem = Crypto.generate_key_pair()
+                log_event("Key Renewal", "Generated new key pair for renewal.")
+
+                # Send the new public key to the client
+                conn.sendall(new_public_pem)
+                log_event("Key Renewal", "Sent new public key to client.")
+
+                # Load the new private key
+                new_private_key = serialization.load_pem_private_key(
+                    new_private_pem,
+                    password=None,
+                    backend=default_backend()
+                )
+                log_event("Key Renewal", "Loaded new private key.")
+
+                # Assume client sends its new public key in response
+                client_new_public_pem = conn.recv(2048)
+                client_new_public_key = serialization.load_pem_public_key(
+                    client_new_public_pem,
+                    backend=default_backend()
+                )
+                log_event("Key Renewal", "Received new public key from client.")
+
+                # Derive the new session key
+                context = b"session key derivation"
+                self.session_key = Crypto.derive_session_key(client_new_public_key, new_private_key, context)
+                log_event("Session", "New session key derived successfully.")
+
+                # Send key renewal response acknowledgment
+                renewal_ack = packageMessage(
+                    encryptedMessage='',
+                    signature='',
+                    nonce=self.nonce_manager.generate_nonce(),
+                    timestamp=self.nonce_manager.get_current_timestamp(),
+                    type="keyRenewalResponse"
+                )
+                sendData(self.client_address, renewal_ack)
+                log_event("Key Renewal", "Sent key renewal acknowledgment to client.")
+
+            except Exception as e:
+                log_event("Error", f"Key renewal failed: {e}")
+
+        def request_key_renewal(self, conn, addr):
+            """
+            Initiates the key renewal process by sending a key renewal request to the client.
+            """
+            try:
+                # Send key renewal request
+                key_renewal_request = packageMessage(
+                    encryptedMessage='',
+                    signature='',
+                    nonce=self.nonce_manager.generate_nonce(),
+                    timestamp=self.nonce_manager.get_current_timestamp(),
+                    type="keyRenewalRequest"
+                )
+                sendData(addr, key_renewal_request)
+                log_event("Key Renewal", "Sent key renewal request to client.")
+            except Exception as e:
+                log_event("Error", f"Failed to send key renewal request: {e}")
+
+        def terminate_session(self, conn, addr):
+            """
+            Terminates the session by notifying the client and closing the connection.
+            """
+            try:
+                termination_message = packageMessage(
+                    encryptedMessage='',
+                    signature='',
+                    nonce=self.nonce_manager.generate_nonce(),
+                    timestamp=self.nonce_manager.get_current_timestamp(),
+                    type="sessionTermination"
+                )
+                sendData(addr, termination_message)
+                log_event("Session Termination", "Sent session termination message to client.")
+            except Exception as e:
+                log_event("Error", f"Failed to send session termination message: {e}")
+            finally:
+                conn.close()
+                log_event("Session Termination", "Session terminated and connection closed.")
+
+    def send_message(self, conn, addr, message):
         """
         Sends a message to the connected client.
         
@@ -176,7 +273,7 @@ class Server:
 
         try:
             # Send the packaged message to the client
-            sendData(self.client_address, message_package)
+            sendData(addr, message_package)
             log_event("Network", "Server message sent to client.")
         except Exception as e:
             # Log any errors encountered during message sending
