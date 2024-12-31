@@ -1,26 +1,54 @@
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.x509 import load_pem_x509_certificate
-from cryptography.hazmat.backends import default_backend
-from cryptography.x509.oid import ExtensionOID
+from cryptography.x509 import load_pem_x509_certificate, ocsp
+from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
 from cryptography.x509.extensions import ExtensionNotFound
 import requests
 import time
 import threading
 from Crypto import Crypto
-from cryptography.x509 import ocsp
-from cryptography.hazmat.primitives.asymmetric import padding
 import logging
-from cryptography.x509 import ocsp, AuthorityInformationAccessOID
 import datetime
+from typing import Optional, Dict
+from cryptography import x509
+from cryptography.x509 import ocsp
+from cryptography.exceptions import InvalidKey
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
+from Utils import log_event, log_error, ErrorCode
+from cryptography.hazmat.backends import default_backend
 
 class KeyManagement:
     def __init__(self):
-        self.current_session_keys = {
-            "private_key": None,
-            "public_key": None
-        }
+        self._session_keys = {}
+        self._key_lock = threading.RLock()  # Use RLock for reentrant locking
+        self._renewal_scheduler = None
+        
+    def get_session_key(self, client_id: str) -> Optional[bytes]:
+        """Thread-safe session key retrieval."""
+        with self._key_lock:
+            return self._session_keys.get(client_id)
+            
+    def set_session_key(self, client_id: str, key: bytes):
+        """Thread-safe session key setting."""
+        with self._key_lock:
+            self._session_keys[client_id] = key
+            
+    def remove_session_key(self, client_id: str):
+        """Thread-safe session key removal."""
+        with self._key_lock:
+            self._session_keys.pop(client_id, None)
+            
+    def clear_session_keys(self):
+        """Thread-safe clearing of all session keys."""
+        with self._key_lock:
+            self._session_keys.clear()
+            
+    def update_session_keys(self, updates: Dict[str, bytes]):
+        """Thread-safe bulk update of session keys."""
+        with self._key_lock:
+            self._session_keys.update(updates)
 
     # Certificate Handling with OCSP
     @staticmethod
@@ -94,8 +122,7 @@ class KeyManagement:
                     issuer_public_key.verify(
                         ocsp_response.signature,
                         ocsp_response.tbs_response_bytes,
-                        padding.PKCS1v15(),
-                        ocsp_response.signature_hash_algorithm,
+                        ec.ECDSA(ocsp_response.signature_hash_algorithm)
                     )
                     
                     now = datetime.utcnow()
@@ -140,7 +167,7 @@ class KeyManagement:
         try:
             print("Handling key renewal request.")
             private_key, public_key = Crypto.generate_key_pair()
-            session_key = Crypto.derive_session_key(peer_public_key, private_key)
+            session_key = Crypto.derive_session_key(peer_public_key, private_key, b"session key derivation")
             return session_key, public_key
         except Exception as e:
             raise RuntimeError(f"Session key derivation failed: {e}") from e
@@ -202,5 +229,136 @@ class KeyManagement:
         except Exception as e:
             logging.error(f"Signature verification failed: {e}")
             return False
+
+
+class OCSPValidator:
+    def __init__(self):
+        self._cache = {}  # Cache for OCSP responses
+        self._cache_lock = threading.Lock()
+        self.cache_duration = timedelta(hours=1)  # Cache OCSP responses for 1 hour
+        
+    def _get_cached_response(self, cert_id: str) -> Optional[tuple]:
+        """Get cached OCSP response if still valid."""
+        with self._cache_lock:
+            if cert_id in self._cache:
+                response, timestamp = self._cache[cert_id]
+                if datetime.utcnow() - timestamp < self.cache_duration:
+                    return response
+                else:
+                    del self._cache[cert_id]
+        return None
+        
+    def _cache_response(self, cert_id: str, response: ocsp.OCSPResponse):
+        """Cache an OCSP response."""
+        with self._cache_lock:
+            self._cache[cert_id] = (response, datetime.utcnow())
+            
+    def check_certificate_revocation(self, certificate: x509.Certificate, 
+                                   issuer_certificate: x509.Certificate) -> bool:
+        """
+        Check certificate revocation status using OCSP.
+        
+        Args:
+            certificate: The certificate to check
+            issuer_certificate: The issuer's certificate
+            
+        Returns:
+            bool: True if certificate is valid, False if revoked
+            
+        Raises:
+            ValueError: If OCSP checking fails
+        """
+        try:
+            # Get OCSP server URL
+            ocsp_servers = certificate.extensions.get_extension_for_oid(
+                x509.oid.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
+            ).value.get_values_for_type(x509.AccessDescription.OCSP)
+            
+            if not ocsp_servers:
+                raise ValueError("No OCSP servers found in certificate")
+                
+            # Create OCSP request
+            builder = ocsp.OCSPRequestBuilder()
+            builder = builder.add_certificate(
+                certificate, issuer_certificate, hashes.SHA256()
+            )
+            request = builder.build()
+            
+            # Check cache first
+            cert_id = certificate.fingerprint(hashes.SHA256()).hex()
+            cached_response = self._get_cached_response(cert_id)
+            if cached_response:
+                return self._validate_response(cached_response, certificate, 
+                                            issuer_certificate)
+            
+            # Try each OCSP server
+            for server in ocsp_servers:
+                try:
+                    response = self._get_ocsp_response(server.access_location.value,
+                                                     request)
+                    if response:
+                        self._cache_response(cert_id, response)
+                        return self._validate_response(response, certificate,
+                                                     issuer_certificate)
+                except Exception as e:
+                    log_event("OCSP", f"Server check failed: {e}")
+                    continue
+                    
+            raise ValueError("All OCSP servers failed")
+            
+        except Exception as e:
+            log_error(ErrorCode.AUTHENTICATION_ERROR, f"OCSP check failed: {e}")
+            raise
+            
+    def _get_ocsp_response(self, url: str, request: ocsp.OCSPRequest) -> Optional[ocsp.OCSPResponse]:
+        """Get OCSP response from server."""
+        try:
+            response = requests.post(
+                url,
+                data=request.public_bytes(serialization.Encoding.DER),
+                headers={'Content-Type': 'application/ocsp-request'},
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                raise ValueError(f"OCSP server returned status {response.status_code}")
+                
+            return ocsp.load_der_ocsp_response(response.content)
+            
+        except Exception as e:
+            log_event("OCSP", f"Failed to get OCSP response: {e}")
+            return None
+            
+    def _validate_response(self, response: ocsp.OCSPResponse,
+                          certificate: x509.Certificate,
+                          issuer_certificate: x509.Certificate) -> bool:
+        """Validate OCSP response."""
+        if response.response_status != ocsp.OCSPResponseStatus.SUCCESSFUL:
+            raise ValueError(f"OCSP response unsuccessful: {response.response_status}")
+            
+        # Verify response signature
+        issuer_public_key = issuer_certificate.public_key()
+        try:
+            issuer_public_key.verify(
+                response.signature,
+                response.tbs_response_bytes,
+                ec.ECDSA(response.signature_hash_algorithm)
+            )
+        except InvalidKey:
+            raise ValueError("Invalid OCSP response signature")
+            
+        # Check response validity period
+        now = datetime.utcnow()
+        if not (response.this_update <= now <= response.next_update):
+            raise ValueError("OCSP response is outside its validity period")
+            
+        # Check certificate status
+        if response.certificate_status == ocsp.OCSPCertStatus.GOOD:
+            return True
+        elif response.certificate_status == ocsp.OCSPCertStatus.REVOKED:
+            log_event("Security", f"Certificate revoked: {response.revocation_reason}")
+            return False
+        else:
+            raise ValueError(f"Unknown certificate status: {response.certificate_status}")
 
 

@@ -4,10 +4,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes, aead
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidTag
 import os
 import secrets
 import logging
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,23 +32,23 @@ class SecureMessage:
         self.version = version
         self.salt = salt
 
-    def to_dict(self) -> Dict[str, bytes]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            'ciphertext': self.ciphertext,
-            'nonce': self.nonce,
-            'tag': self.tag,
-            'version': self.version.to_bytes(4, 'big'),
-            'salt': self.salt
+            'ciphertext': self.ciphertext.hex(),
+            'nonce': self.nonce.hex(),
+            'tag': self.tag.hex(),
+            'version': self.version,
+            'salt': self.salt.hex()
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, bytes]) -> 'SecureMessage':
+    def from_dict(cls, data: Dict[str, Any]) -> 'SecureMessage':
         return cls(
-            ciphertext=data['ciphertext'],
-            nonce=data['nonce'],
-            tag=data['tag'],
-            version=int.from_bytes(data['version'], 'big'),
-            salt=data['salt']
+            ciphertext=bytes.fromhex(data['ciphertext']),
+            nonce=bytes.fromhex(data['nonce']),
+            tag=bytes.fromhex(data['tag']),
+            version=data['version'],
+            salt=bytes.fromhex(data['salt'])
         )
 
 class Crypto:
@@ -57,7 +58,7 @@ class Crypto:
             raise RuntimeError("Secure random number generator is not available")
 
     @staticmethod
-    def generate_key_pair() -> Tuple[bytes, bytes]:
+    def generate_key_pair(password: Optional[bytes] = None) -> Tuple[bytes, bytes]:
         """
         Generate an EC key pair for key exchange.
         Returns: (public_key_pem, private_key_pem)
@@ -68,13 +69,17 @@ class Crypto:
                 backend=default_backend()
             )
 
-            # Use strong encryption for private key storage
+            # Use password for private key encryption if provided
+            encryption_algorithm = (
+                serialization.NoEncryption()
+                if password is None
+                else serialization.BestAvailableEncryption(password)
+            )
+
             private_pem = private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.BestAvailableEncryption(
-                    secrets.token_bytes(32)
-                )
+                encryption_algorithm=encryption_algorithm
             )
 
             public_key = private_key.public_key()
@@ -84,7 +89,8 @@ class Crypto:
             )
 
             logger.info("Generated new key pair")
-            return (public_pem, private_pem)
+            return public_pem, private_pem
+
         except Exception as e:
             logger.error(f"Key pair generation failed: {str(e)}")
             raise RuntimeError(f"Key pair generation failed: {str(e)}")
@@ -187,7 +193,6 @@ class Crypto:
 
             logger.info("Data decrypted successfully")
             return plaintext
-
         except Exception as e:
             logger.error(f"Decryption failed: {str(e)}")
             raise RuntimeError(f"Decryption failed: {str(e)}")
@@ -228,5 +233,62 @@ class Crypto:
             h.update(data)
             h.verify(mac)
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"MAC verification failed: {e}")
             return False
+
+    @staticmethod
+    def aes_encrypt(data: bytes, key: bytes) -> Tuple[bytes, bytes, bytes]:
+        """
+        Encrypt data using AES-GCM and return (nonce, ciphertext, tag).
+        """
+        if len(key) != CryptoConstants.AES_KEY_SIZE:
+            raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
+        
+        try:
+            nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
+            aesgcm = AESGCM(key)
+            ciphertext = aesgcm.encrypt(nonce, data, None)
+            tag = ciphertext[-16:]
+            ciphertext = ciphertext[:-16]
+            return nonce, ciphertext, tag
+        except Exception as e:
+            logger.error(f"AES encryption failed: {e}")
+            raise RuntimeError(f"AES encryption failed: {e}")
+
+    @staticmethod
+    def aes_decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes) -> bytes:
+        """
+        Decrypt data using AES-GCM with explicit tag validation.
+        
+        Args:
+            ciphertext: The encrypted data
+            key: The encryption key
+            nonce: The nonce used for encryption
+            tag: The authentication tag
+            
+        Returns:
+            The decrypted data
+            
+        Raises:
+            InvalidTag: If the authentication tag is invalid
+            ValueError: If the key length is invalid
+        """
+        if len(key) != CryptoConstants.AES_KEY_SIZE:
+            raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
+        
+        try:
+            # Create AESGCM instance
+            aesgcm = AESGCM(key)
+            
+            # Explicitly verify the tag by attempting decryption
+            # If tag is invalid, this will raise InvalidTag
+            plaintext = aesgcm.decrypt(nonce, ciphertext + tag, None)
+            
+            return plaintext
+        except InvalidTag as e:
+            logger.error("Authentication tag verification failed")
+            raise InvalidTag("Message authentication failed - possible tampering detected")
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            raise RuntimeError(f"Decryption failed: {e}")

@@ -9,6 +9,7 @@ from cryptography.hazmat.backends import default_backend
 
 class Client:
     def __init__(self):
+        self._lock = threading.Lock()
         # Initialize key management and nonce manager
         self.key_manager = KeyManagement()
         self.nonce_manager = NonceManager()
@@ -18,10 +19,15 @@ class Client:
         self.destination = None
         self.private_key = None  # Add attribute to store client's private key
         self.public_key = None   # Add attribute to store client's public key
+        self.socket = None  # Add attribute to store the active socket
 
         # Schedule automated key renewal every 3600 seconds (1 hour)
         renewal_interval = 3600
         self.key_manager.schedule_key_renewal(renewal_interval)
+
+    def set_session_key(self, key):
+        with self._lock:
+            self.session_key = key
 
     def establish_session(self, destination):
         """
@@ -36,23 +42,26 @@ class Client:
         public_pem, private_pem = Crypto.generate_key_pair()
         log_event("Key Generation", "Client key pair generated.")
 
-        # Connect to the server
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.connect(destination)
-                log_event("Network", f"Connected to server at {destination}.")
+        # Connect to the server and store the socket
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(30)  # 30 second timeout
+            self.socket.connect(destination)
+            log_event("Network", f"Connected to server at {destination}.")
 
-                # Send the client's public key to the server
-                s.sendall(public_pem)
-                log_event("Key Exchange", "Sent public key to server.")
+            # Send the client's public key to the server
+            self.socket.sendall(public_pem)
+            log_event("Key Exchange", "Sent public key to server.")
 
-                # Receive the server's public key
-                server_public_pem = s.recv(2048)
-                log_event("Key Exchange", "Received public key from server.")
+            # Receive the server's public key
+            server_public_pem = self.socket.recv(2048)
+            log_event("Key Exchange", "Received public key from server.")
 
-            except Exception as e:
-                log_event("Error", f"Failed to establish connection: {e}")
-                return
+        except Exception as e:
+            log_event("Error", f"Failed to establish connection: {e}")
+            if self.socket:
+                self.socket.close()
+            return
 
         # Load the server's public key
         try:
@@ -61,6 +70,7 @@ class Client:
                 backend=default_backend()
             )
             log_event("Key Exchange", "Server public key loaded successfully.")
+            self.server_public_key = server_public_key
         except Exception as e:
             log_event("Error", f"Failed to load server public key: {e}")
             return
@@ -88,61 +98,52 @@ class Client:
 
     def send_message(self, message):
         """
-        Sends a message to the server.
+        Sends a signed message to the server.
         
         Args:
             message (str): The message to send.
         """
-        if not self.session_key:
-            log_event("Error", "Session not established. Cannot send message.")
-            return
+        if not self.socket or not self.session_key or not self.private_key:
+            log_event("Error", "Invalid client state for sending messages")
+            raise RuntimeError("Client not properly initialized")
 
-        nonce = self.nonce_manager.generate_nonce()  # Generate a unique nonce
-        timestamp = self.nonce_manager.get_current_timestamp()  # Get the current timestamp
+        # Encrypt the message using the session key
+        iv, ciphertext, tag = Crypto.aes_encrypt(message.encode('utf-8'), self.session_key)
+        log_event("Encryption", "Message encrypted successfully.")
 
-        # Encrypt the message using AES-GCM
-        secure_msg = Crypto.encrypt(message.encode('utf-8'), self.session_key)
-
-        # Serialize the secure message
-        msg_dict = secure_msg.to_dict()
-
-        # Package the message for transmission
+        # Package the message without signature first
+        nonce = self.nonce_manager.generate_nonce()
         message_package = packageMessage(
-            encryptedMessage=msg_dict['ciphertext'].hex(),
-            nonce=msg_dict['nonce'].hex(),
-            tag=msg_dict['tag'].hex(),
-            timestamp=timestamp,
+            encryptedMessage=ciphertext.hex(),
+            signature='',  # Placeholder
+            nonce=nonce,
+            timestamp=self.nonce_manager.get_current_timestamp(),
             type="data",
-            iv=msg_dict['nonce'].hex()  # Using nonce as IV for AES-GCM
+            iv=iv.hex()
         )
-        log_event("Message Packaging", "Message packaged successfully.")
 
-        # Prepare the message for signing
-        message_bytes = message_package.encode('utf-8')
-
-        # Sign the message
-        signature = self.key_manager.sign_message(self.private_key, message_bytes)
+        # Sign the entire message package
+        signature = self.key_manager.sign_message(self.private_key, message_package.encode('utf-8'))
+        log_event("Message Signing", "Message signed successfully.")
 
         # Update the message package with the signature
         message_package_dict = {
-            "encryptedMessage": msg_dict['ciphertext'].hex(),
-            "nonce": msg_dict['nonce'].hex(),
-            "tag": msg_dict['tag'].hex(),
-            "timestamp": timestamp,
+            "encryptedMessage": ciphertext.hex(),
+            "nonce": nonce,
+            "timestamp": self.nonce_manager.get_current_timestamp(),
             "type": "data",
-            "iv": msg_dict['nonce'].hex(),  # Using nonce as IV for AES-GCM
-            "signature": signature.hex()
+            "iv": iv.hex(),
+            "signature": signature.hex(),
+            "tag": tag.hex()
         }
         message_package_signed = packageMessage(**message_package_dict)
-        log_event("Message Signing", "Message signed successfully.")
 
         try:
-            # Send the signed message to the server
-            sendData(self.destination, message_package_signed)
+            # Send the signed message using the active socket
+            sendData(self.socket, message_package_signed)  # Fixed parameter to use self.socket
             log_event("Network", "Message sent to the server.")
         except Exception as e:
-            # Log any errors encountered during message sending
-            log_event("Error", f"Failed to send message: {e}")
+            log_event("Error", f"Failed to send message: {e}")  # Fixed incomplete logging
 
     def receive_messages(self):
         """
@@ -154,7 +155,7 @@ class Client:
 
         while self.listening:
             try:
-                received_package = receiveData()
+                received_package = receiveData(self.socket)  # Pass the connected socket
                 if not received_package:
                     continue
 
@@ -222,17 +223,8 @@ class Client:
                         continue
 
                     # Decrypt the message
-                    ciphertext = bytes.fromhex(parsed_message['encryptedMessage']) + bytes.fromhex(parsed_message['tag'])
-                    decrypted_message = Crypto.decrypt(
-                        SecureMessage(
-                            ciphertext=ciphertext[:-16],
-                            nonce=bytes.fromhex(parsed_message['nonce']),
-                            tag=ciphertext[-16:],
-                            version=1,
-                            salt=b''  # Assuming salt is managed elsewhere
-                        ),
-                        self.session_key
-                    )
+                    secure_msg = SecureMessage.from_dict(parsed_message)
+                    decrypted_message = Crypto.decrypt(secure_msg, self.session_key)
 
                     log_event("Message", f"Decrypted message: {decrypted_message.decode('utf-8')}")
                 
@@ -249,7 +241,7 @@ class Client:
             log_event("Key Renewal", "Generated new key pair for renewal.")
 
             # Send the new public key to the server
-            sendData(self.destination, new_public_pem)
+            sendData(self.socket, new_public_pem)
             log_event("Key Renewal", "Sent new public key to server.")
 
             # Load the new private key
@@ -261,7 +253,7 @@ class Client:
             log_event("Key Renewal", "Loaded new private key.")
 
             # Assume server sends its new public key in response
-            server_new_public_pem = receiveData()
+            server_new_public_pem = receiveData(self.socket)
             server_new_public_key = serialization.load_pem_public_key(
                 server_new_public_pem,
                 backend=default_backend()
@@ -270,7 +262,7 @@ class Client:
 
             # Derive the new session key
             context = b"session key derivation"
-            self.session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
+            new_session_key = Crypto.derive_session_key(server_new_public_key, new_private_key, context)
             log_event("Session", "New session key derived successfully.")
 
             # Send key renewal response acknowledgment
@@ -281,8 +273,13 @@ class Client:
                 timestamp=self.nonce_manager.get_current_timestamp(),
                 type="keyRenewalResponse"
             )
-            sendData(self.destination, renewal_ack)
+            sendData(self.socket, renewal_ack)
             log_event("Key Renewal", "Sent key renewal acknowledgment to server.")
+
+            with self._lock:
+                self.private_key = new_private_key
+                self.server_public_key = server_new_public_key
+                self.session_key = new_session_key
 
         except Exception as e:
             log_event("Error", f"Key renewal failed: {e}")
@@ -297,7 +294,7 @@ class Client:
             log_event("Key Renewal", "Generated new key pair for renewal.")
 
             # Send the new public key to the server
-            sendData(self.destination, client_new_public_pem)
+            sendData(self.socket, client_new_public_pem)
             log_event("Key Renewal", "Sent new public key to server.")
 
             # Load the new private key
@@ -309,7 +306,7 @@ class Client:
             log_event("Key Renewal", "Loaded new private key.")
 
             # Receive the server's new public key
-            server_new_public_pem = receiveData()
+            server_new_public_pem = receiveData(self.socket)
             server_new_public_key = serialization.load_pem_public_key(
                 server_new_public_pem,
                 backend=default_backend()
@@ -323,28 +320,45 @@ class Client:
 
         except Exception as e:
             log_event("Error", f"Handling key renewal response failed: {e}")
+            self.terminate_session()  # Critical failure should terminate session
 
     def terminate_session(self):
         """
         Terminates the session by notifying the server and cleaning up resources.
         """
         try:
-            # Send session termination message to server
-            termination_message = packageMessage(
-                encryptedMessage='',
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=self.nonce_manager.get_current_timestamp(),
-                type="sessionTermination"
-            )
-            sendData(self.destination, termination_message)
-            log_event("Session Termination", "Sent session termination message to server.")
+            if self.socket and self.socket.fileno() != -1:  # Check if socket is still valid
+                # Send session termination message to server
+                termination_message = packageMessage(
+                    encryptedMessage='',
+                    signature='',
+                    nonce=self.nonce_manager.generate_nonce(),
+                    timestamp=self.nonce_manager.get_current_timestamp(),
+                    type="sessionTermination"
+                )
+                try:
+                    sendData(self.socket, termination_message)
+                    log_event("Session Termination", "Sent session termination message to server.")
+                except Exception as e:
+                    log_event("Warning", f"Could not send termination message: {e}")
         except Exception as e:
-            log_event("Error", f"Failed to send session termination message: {e}")
+            log_event("Error", f"Error during session termination: {e}")
         finally:
+            # Ensure all resources are cleaned up
             self.stop_listening()
+            if self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass  # Socket might already be closed
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
             self.session_key = None
-            log_event("Session Termination", "Session terminated successfully.")
+            self.server_public_key = None  # Also clean up keys
+            log_event("Session Termination", "Session terminated and resources cleaned up.")
 
     def start_listening(self):
         """

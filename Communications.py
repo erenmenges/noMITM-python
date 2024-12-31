@@ -1,14 +1,70 @@
 import json
 import socket
 import time
+from Utils import log_event
+import threading
+from enum import Enum, auto
 
 # Communication Module Functions
 
 # Message Packaging and Parsing
 
-def packageMessage(encryptedMessage, signature, nonce, timestamp, type="data", iv=""):
-    # Create a dictionary with the message details
+class SequenceNumberManager:
+    def __init__(self):
+        self._sequence = 0
+        self._lock = threading.Lock()
+    
+    def get_next_sequence_number(self) -> int:
+        """
+        Gets the next sequence number in a thread-safe manner.
+        
+        Returns:
+            int: The next sequence number
+        """
+        with self._lock:
+            self._sequence = (self._sequence + 1) % (2**32)  # Wrap around at 2^32
+            return self._sequence
+
+# Create a global instance
+_sequence_manager = SequenceNumberManager()
+
+def get_next_sequence_number() -> int:
+    """
+    Gets the next message sequence number.
+    
+    Returns:
+        int: The next sequence number
+    """
+    return _sequence_manager.get_next_sequence_number()
+
+class MessageType(Enum):
+    DATA = "data"
+    KEY_RENEWAL_REQUEST = "keyRenewalRequest"
+    KEY_RENEWAL_RESPONSE = "keyRenewalResponse"
+    SESSION_TERMINATION = "sessionTermination"
+    ACKNOWLEDGE = "acknowledge"
+    ERROR = "error"
+
+def packageMessage(encryptedMessage, signature, nonce, timestamp, type=MessageType.DATA, iv=""):
+    """
+    Creates a message package with sequence number for ordering and replay protection.
+    
+    Args:
+        encryptedMessage: The encrypted message content
+        signature: The message signature
+        nonce: The message nonce
+        timestamp: The message timestamp
+        type: The message type
+        iv: The initialization vector
+        
+    Returns:
+        str: JSON string containing the message package
+    """
+    if isinstance(type, MessageType):
+        type = type.value
+        
     message_package = {
+        "sequence": get_next_sequence_number(),
         "encryptedMessage": encryptedMessage,
         "signature": signature,
         "nonce": nonce,
@@ -16,46 +72,124 @@ def packageMessage(encryptedMessage, signature, nonce, timestamp, type="data", i
         "type": type,
         "iv": iv
     }
-    # Serialize the dictionary to a JSON string for transmission
     return json.dumps(message_package)
+
+def validate_message_data(data: dict) -> bool:
+    """
+    Validate message data structure and content.
+    
+    Args:
+        data: Dictionary containing message data
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    required_fields = {
+        'sequence': int,
+        'encryptedMessage': str,
+        'signature': str,
+        'nonce': str,
+        'timestamp': (int, float),
+        'type': str,
+        'iv': str
+    }
+    
+    try:
+        # Check all required fields exist and have correct types
+        for field, field_type in required_fields.items():
+            if field not in data:
+                log_event("Validation", f"Missing required field: {field}")
+                return False
+            if not isinstance(data[field], field_type):
+                log_event("Validation", f"Invalid type for field {field}")
+                return False
+                
+        # Validate message size
+        if len(data['encryptedMessage']) > MAX_MESSAGE_SIZE:
+            log_event("Validation", "Message size exceeds maximum allowed")
+            return False
+            
+        # Validate message type
+        if not validate_message_type(data['type']):
+            log_event("Validation", f"Invalid message type: {data['type']}")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        log_event("Error", f"Message validation failed: {e}")
+        return False
 
 def parseMessage(package):
     """
-    Parses a received message package.
-
-    Args:
-        package (str): The JSON string containing the message package.
-
-    Returns:
-        dict: A dictionary containing the parsed message details.
+    Parses and validates a received message package.
     """
-    # Deserialize the JSON string to a Python dictionary
-    return json.loads(package)
+    try:
+        # Parse JSON with size limit
+        if len(package) > MAX_MESSAGE_SIZE:
+            raise ValueError("Message size exceeds maximum allowed")
+            
+        data = json.loads(package)
+        
+        # Validate parsed data
+        if not validate_message_data(data):
+            raise ValueError("Invalid message format")
+            
+        return data
+        
+    except json.JSONDecodeError as e:
+        log_event("Error", f"Invalid JSON format: {e}")
+        raise ValueError("Malformed message")
+    except Exception as e:
+        log_event("Error", f"Message parsing failed: {e}")
+        raise
 
 # Network Communication
 
-def sendData(destination, data):
-    # Create a socket object for TCP communication
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # Connect to the destination server
-        s.connect(destination)
-        # Send the data after encoding it to bytes
-        s.sendall(data.encode('utf-8'))
+MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB
 
-def receiveData():
-    # Create a socket object for TCP communication
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # Bind the socket to a specific address and port
-        s.bind(("0.0.0.0", 8080))
-        # Start listening for incoming connections
-        s.listen()
-        # Accept a connection from a client
-        conn, addr = s.accept()
-        with conn:
-            print(f"Connection established with {addr}")
-            # Receive data from the client
-            data = conn.recv(1024)  # Buffer size is 1024 bytes
-            return data.decode('utf-8')
+def sendData(conn, data):
+    """
+    Sends data over an existing socket connection.
+
+    Args:
+        conn (socket.socket): The connected socket object.
+        data (str): The data to send.
+    
+    Returns:
+        None
+    """
+    try:
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if len(data) > MAX_MESSAGE_SIZE:
+            raise ValueError(f"Message size exceeds maximum allowed size of {MAX_MESSAGE_SIZE} bytes")
+        conn.sendall(data)
+    except socket.error as e:
+        log_event("Error", f"Failed to send data: {e}")
+        raise
+
+def receiveData(conn):
+    """
+    Receives data over an existing socket connection.
+    
+    Args:
+        conn (socket.socket): The connected socket object.
+    
+    Returns:
+        str: The received data.
+    """
+    try:
+        chunks = []
+        while True:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks).decode('utf-8')
+    except Exception as e:
+        log_event("Error", f"Failed to receive data: {e}")
+        raise
 
 # Key Renewal Messages
 
@@ -77,3 +211,11 @@ def handleKeyRenewalResponse(message):
         raise ValueError("Invalid message type for key renewal response.")
     # Return the parsed response
     return response
+
+def validate_message_type(message_type: str) -> bool:
+    """Validate that the message type is recognized."""
+    try:
+        MessageType(message_type)
+        return True
+    except ValueError:
+        return False
