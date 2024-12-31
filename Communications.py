@@ -6,13 +6,15 @@ import time
 
 # Message Packaging and Parsing
 
-def packageMessage(encryptedMessage, signature, nonce, timestamp):
+def packageMessage(encryptedMessage, signature, nonce, timestamp, type="data", iv=""):
     # Create a dictionary with the message details
     message_package = {
         "encryptedMessage": encryptedMessage,
         "signature": signature,
         "nonce": nonce,
-        "timestamp": timestamp
+        "timestamp": timestamp,
+        "type": type,
+        "iv": iv
     }
     # Serialize the dictionary to a JSON string for transmission
     return json.dumps(message_package)
