@@ -11,6 +11,10 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
 from cryptography.x509.oid import ExtensionOID, NameOID, AuthorityInformationAccessOID
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import utils
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # Local imports
 from Communications import (
@@ -18,7 +22,7 @@ from Communications import (
     parseMessage, 
     sendData, 
     receiveData, 
-    MessageType,
+    MessageType, 
     MAX_MESSAGE_SIZE
 )
 from Crypto import (
@@ -55,7 +59,13 @@ class Server:
         self.clients: Dict[str, dict] = {}
         self.running = False
         self.server_socket = None
-        self.key_manager = KeyManagement()
+        
+        # Create secure storage first
+        self._secure_storage = SecureStorage()  # Add this line
+        
+        # Pass secure storage to KeyManagement
+        self.key_manager = KeyManagement(self._secure_storage)  # Updated this line
+        
         self.nonce_manager = NonceManager()
         self.sequence_manager = SequenceManager()
         self.certificate = None
@@ -66,7 +76,6 @@ class Server:
         self.max_retries = 3
         self.retry_delay = 1
         self._initialized = False  # Track initialization state
-        self._secure_storage = SecureStorage()  # Add secure storage
         
         # Initialize certificates if TLS is enabled
         if self.tls_config.enabled:
@@ -97,33 +106,43 @@ class Server:
             raise
 
     def start(self):
-        """Start the server and listen for connections."""
+        """Start the server with proper error handling."""
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            # If TLS is enabled, wrap the server socket
-            if self.tls_config and self.tls_config.enabled:
-                tls_wrapper = TLSWrapper(self.tls_config)
-                self.server_socket = tls_wrapper.wrap_socket(
-                    self.server_socket,
-                    server_side=True
-                )
-            
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
             self.running = True
-            
             log_event("Server", f"Server started on {self.host}:{self.port}")
             
-            while self.running:
-                client_socket, address = self.server_socket.accept()
-                self._handle_new_connection(client_socket, address)
-                
+            # Start accept loop in a separate thread
+            self._accept_thread = threading.Thread(target=self._accept_connections)
+            self._accept_thread.daemon = True
+            self._accept_thread.start()
+            
         except Exception as e:
-            log_error(ErrorCode.GENERAL_ERROR, f"Server failed to start: {e}")
-            self.stop()
+            log_error(ErrorCode.NETWORK_ERROR, f"Failed to start server: {e}")
             raise
+
+    def _accept_connections(self):
+        """Accept incoming connections with proper error handling."""
+        while self.running:
+            try:
+                log_event("Server", "Waiting for incoming connection...")
+                client_socket, address = self.server_socket.accept()
+                log_event("Server", f"Accepted connection from {address[0]}:{address[1]}")
+                
+                # Handle client in separate thread
+                client_thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+                
+            except Exception as e:
+                if self.running:  # Only log if server is still meant to be running
+                    log_error(ErrorCode.NETWORK_ERROR, f"Error accepting connection: {e}")
 
     def _handle_new_connection(self, client_socket: socket.socket, address: tuple):
         """Handle new client connection with certificate validation."""
@@ -300,183 +319,147 @@ class Server:
         
         log_event("Server", "Server shutdown complete")
 
-    def handle_client(self, conn, addr, client_id):
-        """Handle client connection with proper resource management."""
-        client_data = None
+
+    def process_client_message(self, data: bytes, client_id: str):
+        """Process a message received from a client."""
         try:
-            conn.settimeout(self.connection_timeout)
+            log_event("Communication", f"[PROCESS_MESSAGE] Processing message for client {client_id}")
+            log_event("Communication", f"[PROCESS_MESSAGE] Raw message size: {len(data)} bytes")
             
-            # Initialize client session atomically
-            with self._clients_lock:
-                if client_id in self.clients:
-                    # Store old connection data for cleanup
-                    old_client = self.clients[client_id]
-                    # Update with new connection
-                    client_data = {
-                        'connection': conn,
-                        'address': addr,
-                        'last_activity': time.time(),
-                        'session_established': False,
-                        'recv_buffer': bytearray(),
-                        'send_buffer': bytearray()
-                    }
-                    self.clients[client_id] = client_data
-                    
-                    # Clean up old connection outside the lock
-                    try:
-                        old_client['connection'].shutdown(socket.SHUT_RDWR)
-                        old_client['connection'].close()
-                    except Exception:
-                        pass
-                else:
-                    client_data = {
-                        'connection': conn,
-                        'address': addr,
-                        'last_activity': time.time(),
-                        'session_established': False,
-                        'recv_buffer': bytearray(),
-                        'send_buffer': bytearray()
-                    }
-                    self.clients[client_id] = client_data
-            
-            while self.running:
-                try:
-                    data = receiveData(conn)
-                    if not data:
-                        break
-                    
-                    # Update last activity timestamp
-                    with self._clients_lock:
-                        if client_id in self.clients:
-                            self.clients[client_id]['last_activity'] = time.time()
-                        else:
-                            break
-                    
-                    # Process message
-                    self.process_client_message(data, client_id)
-                    
-                except socket.timeout:
-                    # Check for client timeout
-                    with self._clients_lock:
-                        if client_id in self.clients:
-                            last_activity = self.clients[client_id]['last_activity']
-                            if time.time() - last_activity > self.connection_timeout:
-                                log_event("Connection", f"Client {client_id} timed out")
-                                break
-                    continue
-                except ConnectionError:
-                    break
-                except Exception as e:
-                    log_error(ErrorCode.GENERAL_ERROR, f"Error handling client message: {e}")
-                    break
-        finally:
-            # Ensure cleanup happens
-            with self._clients_lock:
-                if client_id in self.clients:
-                    self.close_client_connection(client_id)
-
-    def process_client_message(self, data: str, client_id: str):
-        """Process incoming client messages and handle different message types."""
-        try:
-            # Parse and validate the message once
-            message = parseMessage(data)
-            
-            if not self.is_connected(client_id):
-                log_error(ErrorCode.STATE_ERROR, f"Client {client_id} not connected")
-                return
-
-            # Validate timestamp
-            timestamp = message.get('timestamp', 0)
-            current_time = int(time.time())
-            
-            # Reject messages older than 5 minutes or future messages
-            if abs(current_time - timestamp) > 300:
-                log_error(ErrorCode.VALIDATION_ERROR, "Message timestamp outside acceptable range")
-                return
-            
-            # Validate sequence number
-            sequence = message.get('sequence')
-            if not self.sequence_manager.validate_sequence(sequence, message.get('sender_id')):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message sequence")
-                return
-
-            message_type = message.get('type')
-            
-            # Handle different message types using enum
-            if message_type == MessageType.DATA.value:
-                self._handle_data_message(client_id, message)
-                
-            elif message_type == MessageType.ACKNOWLEDGE.value:
-                # Handle client acknowledgments
-                log_event("Message", f"Received acknowledgment from client {client_id}")
-                
-            elif message_type == MessageType.KEY_RENEWAL_REQUEST.value:
-                self.handle_key_renewal_request(client_id, message)
-                
-            elif message_type == MessageType.KEY_RENEWAL_RESPONSE.value:
-                # Handle client's response to key renewal
-                self._handle_key_renewal_response(client_id, message)
-                
-            elif message_type == MessageType.SESSION_TERMINATION.value:
-                self._handle_termination_request(client_id)
-                
-            elif message_type == MessageType.ERROR.value:
-                # Handle client error messages
-                error_msg = message.get('encryptedMessage', 'Unknown error')
-                log_error(ErrorCode.CLIENT_ERROR, f"Error from client {client_id}: {error_msg}")
-                
-            else:
-                log_error(ErrorCode.VALIDATION_ERROR, f"Unknown message type: {message_type}")
-                self._send_error_response(
-                    self.clients[client_id]['connection'],
-                    "Unknown message type"
-                )
-                
-        except Exception as e:
-            log_error(ErrorCode.GENERAL_ERROR, f"Error processing client message: {e}")
             try:
-                with self._clients_lock:
-                    if client_id in self.clients:
-                        self._send_error_response(self.clients[client_id]['connection'], str(e))
-            except Exception:
-                pass
+                # Try to parse as JSON first
+                message = json.loads(data.decode('utf-8'))
+                log_event("Communication", f"[PROCESS_MESSAGE] Parsed JSON message: {message.get('type', 'unknown type')}")
+                
+                # Handle key exchange request
+                if message.get('type') == MessageType.KEY_EXCHANGE.value:
+                    log_event("Communication", f"[PROCESS_MESSAGE] Handling key exchange request from {client_id}")
+                    self._handle_key_exchange(message, client_id)
+                    return
 
-    def _handle_data_message(self, client_id: str, message: dict):
-        """Handle data message type."""
-        try:
-            with self._clients_lock:
-                client_data = self.clients[client_id]
-                conn = client_data['connection']
-                session_key = client_data.get('session_key')
+                # For other messages, parse and validate as secure message
+                log_event("Communication", f"[PROCESS_MESSAGE] Processing as secure message")
+                message = parseMessage(data)
+                
+            except json.JSONDecodeError as e:
+                log_error(ErrorCode.VALIDATION_ERROR, f"[PROCESS_MESSAGE] JSON decode error: {str(e)}")
+                message = parseMessage(data)
 
-            if not session_key:
-                raise ValueError("No active session key")
-
-            # Decrypt message
-            secure_msg = SecureMessage.from_dict(message)
-            decrypted_message = Crypto.decrypt(secure_msg, session_key)
-            
-            log_event("Message", f"Received message from client {client_id}")
-            
-            # Send acknowledgment
-            ack_message = packageMessage(
-                encryptedMessage='',
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=int(time.time()),
-                type=MessageType.ACKNOWLEDGE.value
-            )
-            sendData(conn, ack_message)
-            
-            # Send response
-            self.send_response_message(client_id, f"Server received: {decrypted_message}")
-            
-        except (ValueError, DecryptionError) as e:
-            log_error(ErrorCode.ENCRYPTION_ERROR, f"Failed to process encrypted message: {e}")
-            self._handle_encryption_failure(client_id)
         except Exception as e:
-            log_error(ErrorCode.GENERAL_ERROR, f"Error handling data message: {e}")
-            self._send_error_response(conn, "Failed to process message")
+            log_error(ErrorCode.GENERAL_ERROR, f"[PROCESS_MESSAGE] Error processing message: {str(e)}")
+            log_error(ErrorCode.GENERAL_ERROR, f"[PROCESS_MESSAGE] Exception type: {type(e)}")
+
+    def _handle_key_exchange(self, message: dict, client_id: str):
+        """Handle key exchange request from client."""
+        try:
+            log_event("Security", f"[KEY_EXCHANGE] Starting key exchange handling for client {client_id}")
+            
+            # Log the message structure
+            log_event("Security", f"[KEY_EXCHANGE] Message keys: {list(message.keys())}")
+            
+            # Validate basic message structure
+            required_keys = ['type', 'nonce', 'timestamp', 'client_id', 'public_key']
+            if not all(k in message for k in required_keys):
+                missing_keys = [k for k in required_keys if k not in message]
+                log_error(ErrorCode.VALIDATION_ERROR, 
+                         f"[KEY_EXCHANGE] Missing required keys: {missing_keys} for client {client_id}")
+                raise ValueError(f"Invalid key exchange message format. Missing: {missing_keys}")
+            
+            # Validate timestamp
+            current_time = int(time.time())
+            message_time = message['timestamp']
+            time_diff = abs(current_time - message_time)
+            log_event("Security", f"[KEY_EXCHANGE] Message timestamp: {message_time}, "
+                                 f"Current time: {current_time}, Difference: {time_diff}s")
+            
+            if time_diff > 300:  # 5 minutes max difference
+                log_error(ErrorCode.VALIDATION_ERROR, 
+                         f"[KEY_EXCHANGE] Message too old: {time_diff}s for client {client_id}")
+                raise ValueError("Key exchange message timestamp too old")
+            
+            # Get the session key for this client
+            with self._clients_lock:
+                log_event("Security", f"[KEY_EXCHANGE] Retrieving session key for client {client_id}")
+                if client_id not in self.clients:
+                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, 
+                             f"[KEY_EXCHANGE] Client {client_id} not found in clients dictionary")
+                    raise ValueError(f"Client {client_id} not found")
+                    
+                session_key = self.clients[client_id]['session_key']
+                log_event("Security", f"[KEY_EXCHANGE] Retrieved session key for client {client_id}")
+                
+                # Load client's public key
+                log_event("Security", f"[KEY_EXCHANGE] Loading client's public key for {client_id}")
+                log_event("Security", f"[KEY_EXCHANGE] Public key PEM size: {len(message['public_key'])}")
+                client_public_key = serialization.load_pem_public_key(
+                    message['public_key'].encode('utf-8'),
+                    backend=default_backend()
+                )
+                log_event("Security", f"[KEY_EXCHANGE] Public key type: {type(client_public_key)}")
+                log_event("Security", f"[KEY_EXCHANGE] Public key algorithms: {client_public_key.key_size}")
+                
+                # Generate server's ephemeral key pair
+                server_private_key = ec.generate_private_key(
+                    CryptoConstants.CURVE,
+                    backend=default_backend()
+                )
+                server_public_key = server_private_key.public_key()
+
+                # Perform ECDH to derive shared secret
+                shared_key = server_private_key.exchange(
+                    ec.ECDH(),
+                    client_public_key
+                )
+
+                # Derive session key using HKDF
+                derived_key = HKDF(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=None,
+                    info=b'session key',
+                    backend=default_backend()
+                ).derive(shared_key)
+
+                # Store the derived key as session key
+                self.clients[client_id]['session_key'] = derived_key
+
+                # Send server's public key in response
+                response = {
+                    'type': MessageType.KEY_EXCHANGE_RESPONSE.value,
+                    'nonce': self.nonce_manager.generate_nonce(),
+                    'timestamp': int(time.time()),
+                    'public_key': server_public_key.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    ).decode('utf-8')
+                }
+
+                # Send response
+                response_bytes = json.dumps(response).encode('utf-8')
+                sendData(self.clients[client_id]['connection'], response_bytes)
+
+                # Update client state
+                self.clients[client_id]['state'] = 'key_exchanged'
+                
+        except Exception as e:
+            log_error(ErrorCode.KEY_EXCHANGE_ERROR, 
+                     f"[KEY_EXCHANGE] Key exchange failed for client {client_id}: {str(e)}")
+            log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"[KEY_EXCHANGE] Exception type: {type(e)}")
+            
+            # Send error response
+            try:
+                error_response = {
+                    'type': MessageType.ERROR.value,
+                    'error': 'Key exchange failed',
+                    'nonce': self.nonce_manager.generate_nonce(),
+                    'timestamp': int(time.time())
+                }
+                error_bytes = json.dumps(error_response).encode('utf-8')
+                sendData(self.clients[client_id]['connection'], error_bytes)
+            except Exception:
+                pass  # Ignore errors in error handling
+            
+            raise
 
     def _send_error_response(self, conn: socket.socket, error_message: str):
         """Send error response to client."""
@@ -847,16 +830,17 @@ class Server:
         with self._clients_lock:
             if client_id not in self.clients:
                 return
-                
+            
             key_data = {
-                'key': key,
+                'key': key.hex(),  # Convert bytes to hex string for JSON serialization
                 'created_at': time.time(),
                 'last_used': time.time(),
                 'encryption_failures': 0
             }
             
-            # Store in secure storage
-            self._secure_storage.store(f'session_key_{client_id}', key_data)
+            # Convert dict to bytes for secure storage
+            key_data_bytes = json.dumps(key_data).encode('utf-8')
+            self._secure_storage.store(f'session_key_{client_id}', key_data_bytes)
             
             # Update client record
             self.clients[client_id]['has_session_key'] = True
@@ -867,11 +851,250 @@ class Server:
         with self._clients_lock:
             if client_id not in self.clients:
                 return None
+            
+            key_data_bytes = self._secure_storage.retrieve(f'session_key_{client_id}')
+            if key_data_bytes:
+                # Deserialize the stored data
+                key_data = json.loads(key_data_bytes.decode('utf-8'))
+                # Convert hex string back to bytes
+                session_key = bytes.fromhex(key_data['key'])
                 
-            key_data = self._secure_storage.retrieve(f'session_key_{client_id}')
-            if key_data:
                 # Update last used timestamp
                 key_data['last_used'] = time.time()
-                self._secure_storage.store(f'session_key_{client_id}', key_data)
-                return key_data['key']
+                # Store updated data
+                self._secure_storage.store(f'session_key_{client_id}', 
+                                         json.dumps(key_data).encode('utf-8'))
+                
+                return session_key
             return None
+
+    def _handle_client(self, client_socket: socket.socket, address: tuple):
+        """Handle client connection and secure session establishment."""
+        client_id = None
+        try:
+            log_event("Connection", f"[HANDLE_CLIENT] Starting client handler for address {address}")
+            
+            # Set socket timeout
+            original_timeout = client_socket.gettimeout()
+            client_socket.settimeout(self.connection_timeout)
+            log_event("Connection", f"[HANDLE_CLIENT] Changed socket timeout from {original_timeout} to {self.connection_timeout}")
+            
+            # Generate client ID and store connection
+            client_id = self._generate_client_id(address)
+            log_event("Connection", f"[HANDLE_CLIENT] Generated client ID: {client_id}")
+            log_event("Connection", f"[HANDLE_CLIENT] Socket timeout set to {self.connection_timeout} for {client_id}")
+
+            # Store client information
+            with self._clients_lock:
+                log_event("Connection", f"[HANDLE_CLIENT] Acquired clients lock for {client_id}")
+                try:
+                    # Check if client already exists
+                    if client_id in self.clients:
+                        log_event("Connection", f"[HANDLE_CLIENT] Client {client_id} already exists, updating connection")
+                        old_socket = self.clients[client_id].get('connection')
+                        if old_socket:
+                            try:
+                                old_socket.close()
+                                log_event("Connection", f"[HANDLE_CLIENT] Closed old socket for {client_id}")
+                            except Exception as e:
+                                log_error(ErrorCode.NETWORK_ERROR, 
+                                        f"[HANDLE_CLIENT] Error closing old socket for {client_id}: {e}")
+
+                    # Store new client data
+                    self.clients[client_id] = {
+                        'connection': client_socket,
+                        'address': address,
+                        'last_activity': time.time(),
+                        'connection_time': time.time(),
+                        'messages_received': 0,
+                        'messages_sent': 0,
+                        'state': 'connected'
+                    }
+                    log_event("Connection", f"[HANDLE_CLIENT] Client {client_id} information stored in clients dictionary")
+                finally:
+                    log_event("Connection", f"[HANDLE_CLIENT] Released clients lock for {client_id}")
+
+            # TLS handling
+            if self.tls_config and self.tls_config.enabled:
+                log_event("Security", f"[HANDLE_CLIENT] TLS is enabled, starting handshake for {client_id}")
+                try:
+                    tls_wrapper = TLSWrapper(self.tls_config)
+                    log_event("Security", f"[HANDLE_CLIENT] Created TLS wrapper for {client_id}")
+                    
+                    client_socket = tls_wrapper.wrap_socket(client_socket, server_side=True)
+                    log_event("Security", f"[HANDLE_CLIENT] TLS handshake completed successfully for {client_id}")
+                    
+                    # Log TLS session info
+                    cipher = client_socket.cipher()
+                    log_event("Security", f"[HANDLE_CLIENT] TLS session info for {client_id}:")
+                    log_event("Security", f"[HANDLE_CLIENT] - Cipher: {cipher[0]}")
+                    log_event("Security", f"[HANDLE_CLIENT] - Protocol: {cipher[1]}")
+                    log_event("Security", f"[HANDLE_CLIENT] - Bits: {cipher[2]}")
+                    
+                except Exception as e:
+                    log_error(ErrorCode.SECURITY_ERROR, 
+                             f"[HANDLE_CLIENT] TLS handshake failed for {client_id}: {str(e)}")
+                    return
+
+            # Session key generation and storage
+            log_event("Security", f"[HANDLE_CLIENT] Generating session key for {client_id}")
+            try:
+                session_key = os.urandom(32)
+                log_event("Security", f"[HANDLE_CLIENT] Generated {len(session_key)} byte session key")
+                
+                # Store session key in client data
+                with self._clients_lock:
+                    log_event("Security", f"[HANDLE_CLIENT] Acquiring lock to store session key for {client_id}")
+                    self.clients[client_id]['session_key'] = session_key
+                    self.clients[client_id]['connection'] = client_socket
+                    self.clients[client_id]['state'] = 'key_generated'
+                    log_event("Security", f"[HANDLE_CLIENT] Session key stored in client data for {client_id}")
+                
+                # Store in key manager and secure storage
+                self.key_manager.set_session_key(client_id, session_key)
+                self._store_client_session_key(client_id, session_key)
+                log_event("Security", f"[HANDLE_CLIENT] Session key stored in key manager and secure storage for {client_id}")
+                
+            except Exception as e:
+                log_error(ErrorCode.SECURITY_ERROR, 
+                         f"[HANDLE_CLIENT] Failed to generate/store session key for {client_id}: {e}")
+                raise
+
+            # Message handling loop
+            log_event("Communication", f"[HANDLE_CLIENT] Starting message handling loop for {client_id}")
+            message_count = 0
+            
+            while self.running:
+                try:
+                    log_event("Communication", f"[HANDLE_CLIENT] Waiting for data from {client_id} (message {message_count + 1})")
+                    data = receiveData(client_socket)
+                    
+                    if data:
+                        message_count += 1
+                        log_event("Communication", 
+                                 f"[HANDLE_CLIENT] Received message {message_count} from {client_id}: {len(data)} bytes")
+                        log_event("Communication", f"[HANDLE_CLIENT] First 100 bytes: {data[:100].hex()}")
+                    else:
+                        log_event("Connection", f"[HANDLE_CLIENT] Received empty data from {client_id}, closing connection")
+                        break
+
+                    # Update activity timestamp
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            old_timestamp = self.clients[client_id]['last_activity']
+                            self.clients[client_id]['last_activity'] = time.time()
+                            self.clients[client_id]['messages_received'] += 1
+                            log_event("Connection", 
+                                     f"[HANDLE_CLIENT] Updated activity for {client_id}: "
+                                     f"Delta = {time.time() - old_timestamp:.2f}s, "
+                                     f"Total messages = {self.clients[client_id]['messages_received']}")
+                        else:
+                            log_error(ErrorCode.STATE_ERROR, 
+                                    f"[HANDLE_CLIENT] Client {client_id} not found in clients dictionary")
+                            break
+
+                    try:
+                        # Parse message
+                        message_data = json.loads(data.decode('utf-8'))
+                        message_type = message_data.get('type')
+                        
+                        log_event("Communication", 
+                                 f"[HANDLE_CLIENT] Processing message {message_count} of type: {message_type}")
+                        
+                        # Process message based on type
+                        if message_type == MessageType.KEY_EXCHANGE.value:
+                            self.process_client_message(data, client_id)
+                        elif message_type == MessageType.KEEPALIVE.value:
+                            log_event("Connection", 
+                                    f"[HANDLE_CLIENT] Received keepalive from {client_id}")
+                            continue
+                        else:
+                            # Process other message types
+                            self.process_client_message(data, client_id)
+                            
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        log_event("Communication", 
+                                 f"[HANDLE_CLIENT] Message {message_count} is not JSON, processing as binary: {str(e)}")
+                        self.process_client_message(data, client_id)
+
+                except socket.timeout:
+                    log_event("Connection", f"[HANDLE_CLIENT] Socket timeout for {client_id}")
+                    # Check for client timeout
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            last_activity = self.clients[client_id]['last_activity']
+                            inactive_time = time.time() - last_activity
+                            log_event("Connection", 
+                                     f"[HANDLE_CLIENT] Client {client_id} inactive for {inactive_time:.2f}s")
+                            if inactive_time > self.connection_timeout:
+                                log_event("Connection", 
+                                         f"[HANDLE_CLIENT] Client {client_id} timed out after {inactive_time:.2f}s")
+                                break
+                    continue
+
+                except Exception as e:
+                    log_error(ErrorCode.GENERAL_ERROR, 
+                             f"[HANDLE_CLIENT] Error handling message {message_count} from {client_id}: {str(e)}")
+                    log_error(ErrorCode.GENERAL_ERROR, f"[HANDLE_CLIENT] Exception type: {type(e)}")
+                    break
+
+        except Exception as e:
+            log_error(ErrorCode.GENERAL_ERROR, f"[HANDLE_CLIENT] Fatal error in client handler for {client_id}: {str(e)}")
+            log_error(ErrorCode.GENERAL_ERROR, f"[HANDLE_CLIENT] Exception type: {type(e)}")
+            log_error(ErrorCode.GENERAL_ERROR, f"[HANDLE_CLIENT] Stack trace: ", exc_info=True)
+        finally:
+            log_event("Connection", f"[HANDLE_CLIENT] Cleaning up connection for {client_id}")
+            log_event("Connection", f"[HANDLE_CLIENT] Final message count: {message_count}")
+            if client_id:
+                try:
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            final_stats = self.clients[client_id]
+                            log_event("Connection", f"[HANDLE_CLIENT] Final client stats for {client_id}:")
+                            log_event("Connection", f"[HANDLE_CLIENT] - Messages received: {final_stats.get('messages_received', 0)}")
+                            log_event("Connection", f"[HANDLE_CLIENT] - Messages sent: {final_stats.get('messages_sent', 0)}")
+                            log_event("Connection", f"[HANDLE_CLIENT] - Connection duration: {time.time() - final_stats.get('connection_time', time.time()):.2f}s")
+                            log_event("Connection", f"[HANDLE_CLIENT] - Final state: {final_stats.get('state', 'unknown')}")
+                except Exception as e:
+                    log_error(ErrorCode.GENERAL_ERROR, f"[HANDLE_CLIENT] Error logging final stats for {client_id}: {e}")
+                
+                self.close_client_connection(client_id)
+                log_event("Connection", f"[HANDLE_CLIENT] Client handler completed for {client_id}")
+
+    def process_encrypted_message(self, message_data: dict, client_id: str):
+        """Process an encrypted message from a client."""
+        try:
+            # Get the session key for this client
+            session_key = self.key_manager.get_session_key(client_id)
+            if not session_key:
+                log_error(ErrorCode.SECURITY_ERROR, f"No session key for client {client_id}")
+                return
+
+            # Decrypt the message
+            encrypted_data = bytes.fromhex(message_data['data'])
+            try:
+                decrypted_message = Crypto.decrypt(
+                    data=encrypted_data,
+                    key=session_key,
+                    associated_data=b'message'
+                )
+                log_event("Security", f"[SERVER] Message from {client_id} decrypted successfully")
+            except Exception as e:
+                log_error(ErrorCode.CRYPTO_ERROR, f"Failed to decrypt message from {client_id}: {str(e)}")
+                return
+
+            # Process the decrypted message
+            message_text = decrypted_message.decode('utf-8')
+            log_event("Communication", f"Received message from {client_id}: {message_text}")
+
+            # Send acknowledgment
+            response = {
+                'type': MessageType.MESSAGE_ACK.value,
+                'nonce': self.nonce_manager.generate_nonce(),
+                'timestamp': int(time.time())
+            }
+            response_bytes = json.dumps(response).encode('utf-8')
+            sendData(self.clients[client_id]['connection'], response_bytes)
+
+        except Exception as e:
+            log_error(ErrorCode.COMMUNICATION_ERROR, f"Error processing message from {client_id}: {str(e)}")

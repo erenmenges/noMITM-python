@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional, List
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 @dataclass
@@ -15,28 +15,29 @@ class CertificateConfig:
 
 @dataclass
 class TLSConfig:
+    """Configuration for TLS settings."""
     enabled: bool = False
-    cert_config: Optional[CertificateConfig] = None
-    verify_peer: bool = True
-    check_ocsp: bool = True
-    ocsp_timeout: int = 10
-    min_tls_version: str = "TLS1_3"
-    cipher_suites: list[str] = None
-
+    cert_path: Optional[Path] = None
+    key_path: Optional[Path] = None
+    ca_path: Optional[Path] = None
+    verify_mode: str = "NONE"
+    check_hostname: bool = False
+    ciphers: str = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+    protocols: tuple = field(default_factory=lambda: ("TLSv1.2", "TLSv1.3"))
+    options: Dict[str, Any] = field(default_factory=dict)
+    
     def __post_init__(self):
-        if self.enabled and not self.cert_config:
-            raise ValueError("Certificate configuration must be provided when TLS is enabled")
-        
-        if self.cipher_suites is None:
-            self.cipher_suites = [
-                'TLS_AES_256_GCM_SHA384',
-                'TLS_CHACHA20_POLY1305_SHA256',
-                'TLS_AES_128_GCM_SHA256',
-            ]
+        """Convert string paths to Path objects if they're strings."""
+        if isinstance(self.cert_path, str):
+            self.cert_path = Path(self.cert_path)
+        if isinstance(self.key_path, str):
+            self.key_path = Path(self.key_path)
+        if isinstance(self.ca_path, str):
+            self.ca_path = Path(self.ca_path)
 
 @dataclass
 class SecurityConfig:
-    tls: TLSConfig = TLSConfig()
+    tls: TLSConfig = field(default_factory=TLSConfig)
     connection_timeout: int = 30
     enable_mutual_tls: bool = False
     cert_revocation_check: bool = True

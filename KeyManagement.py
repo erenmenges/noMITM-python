@@ -16,21 +16,38 @@ from cryptography.x509 import ocsp
 from cryptography.exceptions import InvalidKey
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
-from Utils import log_event, log_error, ErrorCode
+from Utils import log_event, log_error, ErrorCode, SecurityError
 from cryptography.hazmat.backends import default_backend
 from unittest.mock import MagicMock
 
 class KeyManagement:
-    def __init__(self):
-        """Initialize the KeyManagement instance with default settings."""
-        self._session_keys = {}
-        self._key_lock = threading.RLock()
+    def __init__(self, secure_storage):
+        """Initialize KeyManagement with secure storage."""
+        self._secure_storage = secure_storage
+        self._key_cache = {}
+        self._cache_lock = threading.Lock()
+        self._keys = {}
+        self._key_lock = threading.Lock()
         self._cleanup_thread = None
         self._running = False
-        self.cleanup_interval = 3600  # 1 hour
+        self.cleanup_interval = 300  # 5 minutes
         self.key_expiry = 86400  # 24 hours
         self._last_cleanup = time.time()
-        self.current_session_keys = {}  # Add this line to initialize current_session_keys
+        self.current_session_keys = {}
+        
+        # Generate and store signing key if not exists
+        if not self._secure_storage.retrieve('signing_key'):
+            private_key = ec.generate_private_key(
+                ec.SECP256R1(),
+                default_backend()
+            )
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+            self._secure_storage.store('signing_key', private_bytes)
+            log_event("Security", "[KEY_MGMT] Generated and stored new signing key")
         self.start_cleanup_thread()
 
     def start_cleanup_thread(self):
@@ -57,72 +74,35 @@ class KeyManagement:
             except Exception as e:
                 log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key cleanup error: {e}")
 
-    def get_session_key(self, client_id: str) -> Optional[Dict]:
-        """
-        Thread-safe session key retrieval.
-        
-        Args:
-            client_id: The client identifier
-            
-        Returns:
-            Optional[Dict]: Dictionary containing key and timestamp if found, None otherwise
-        """
+    def get_session_key(self, key_id: str) -> Optional[bytes]:
+        """Retrieve a session key."""
         with self._key_lock:
-            return self._session_keys.get(client_id)
+            key_data = self._keys.get(key_id)
+            if key_data:
+                key_data['last_used'] = time.time()
+                return key_data['key']
+            return None
             
-    def set_session_key(self, client_id: str, key: bytes):
-        """
-        Thread-safe session key setting with timestamp and security validation.
-        
-        Args:
-            client_id: The client identifier
-            key: The session key bytes
-            
-        Raises:
-            ValueError: If the key fails security requirements
-        """
-        if not isinstance(key, bytes):
-            raise ValueError("Key must be bytes")
-        
-        # Check key length (minimum 32 bytes/256 bits)
-        if len(key) < 32:
-            raise ValueError("Key must be at least 32 bytes")
-        
-        # Check for weak keys (all zeros, all ones, repeating patterns)
-        if (all(b == 0 for b in key) or 
-            all(b == 255 for b in key) or
-            len(set(key)) < 10):  # Check for low entropy
-            raise ValueError("Key fails security requirements - potentially weak key")
-        
-        # Hash the key before storage using HKDF
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b"session_key_storage"
-        )
-        stored_key = hkdf.derive(key)
-        
+    def set_session_key(self, key_id: str, key: bytes):
+        """Store a session key."""
         with self._key_lock:
-            self._session_keys[client_id] = {
-                'key': stored_key,  # Store the derived key
-                'timestamp': time.time()
+            self._keys[key_id] = {
+                'key': key,
+                'created': time.time(),
+                'last_used': time.time()
             }
-            
-            # Periodic cleanup
-            if time.time() - self._last_cleanup > self.cleanup_interval:
-                self.cleanup_expired_keys()
-                self._last_cleanup = time.time()
-            
+            log_event("Security", f"[KEY_MGMT] Stored new session key for {key_id}")
+    
     def remove_session_key(self, client_id: str):
         """Thread-safe session key removal."""
         with self._key_lock:
             self._session_keys.pop(client_id, None)
             
     def clear_session_keys(self):
-        """Thread-safe clearing of all session keys."""
+        """Clear all session keys."""
         with self._key_lock:
-            self._session_keys.clear()
+            self._keys.clear()
+            log_event("Security", "[KEY_MGMT] Cleared all session keys")
             
     def update_session_keys(self, updates: Dict[str, bytes]):
         """
@@ -159,35 +139,26 @@ class KeyManagement:
                     raise ValueError("Invalid key data format")
 
     def cleanup_expired_keys(self):
-        """
-        Clean up expired session keys with proper resource management.
-        Keys with None timestamps or invalid timestamp formats are considered expired.
-        """
+        """Clean up expired keys, but only if enough time has passed since last cleanup."""
+        current_time = time.time()
+        
+        # Only cleanup if sufficient time has passed
+        if current_time - self._last_cleanup < self.cleanup_interval:
+            return
+            
         with self._key_lock:
-            current_time = time.time()
-            expired_keys = []
-            
-            # Identify expired keys
-            for client_id, key_data in self._session_keys.items():
-                timestamp = key_data.get('timestamp')
-                try:
-                    # Consider keys with None timestamp or invalid timestamp format as expired
-                    if timestamp is None or not isinstance(timestamp, (int, float)) or \
-                       (current_time - float(timestamp) > self.key_expiry):
-                        expired_keys.append(client_id)
-                except (TypeError, ValueError):
-                    # Any conversion error means the timestamp is invalid
-                    expired_keys.append(client_id)
-            
+            expired_count = 0
             # Clean up expired keys
-            for client_id in expired_keys:
-                key_data = self._session_keys[client_id]
-                if isinstance(key_data.get('key'), bytes):
-                    # Securely clear key material
-                    key_data['key'] = b'\x00' * len(key_data['key'])
-                self._session_keys.pop(client_id)
+            for key_id in list(self._session_keys.keys()):
+                key_data = self._session_keys[key_id]
+                if current_time - key_data['timestamp'] > key_data.get('ttl', self.cleanup_interval):
+                    del self._session_keys[key_id]
+                    expired_count += 1
+            
+            if expired_count > 0:
+                log_event("KeyManagement", f"Cleaned up {expired_count} expired keys")
                 
-            log_event("KeyManagement", f"Cleaned up {len(expired_keys)} expired keys")
+            self._last_cleanup = current_time
 
     # Certificate Handling with OCSP
     @staticmethod
@@ -476,6 +447,28 @@ class KeyManagement:
         except Exception as e:
             logging.error(f"Signature verification failed: {e}")
             return False
+
+    def get_signing_key(self) -> bytes:
+        """Get the current signing key from secure storage.
+        
+        Returns:
+            bytes: The private key used for signing messages
+            
+        Raises:
+            SecurityError: If no signing key is available
+        """
+        try:
+            # Get the private key from secure storage
+            signing_key = self._secure_storage.retrieve('signing_key')
+            if not signing_key:
+                raise SecurityError("No signing key available in secure storage")
+            
+            # Return the key bytes
+            return signing_key
+            
+        except Exception as e:
+            log_error(ErrorCode.SECURITY_ERROR, f"Failed to retrieve signing key: {str(e)}")
+            raise SecurityError("Failed to get signing key") from e
 
 
 class OCSPValidator:

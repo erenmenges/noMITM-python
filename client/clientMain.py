@@ -6,12 +6,14 @@ from typing import Optional, Tuple
 from datetime import datetime
 import time
 from contextlib import contextmanager
-
-# Cryptography imports
+import ssl
 from cryptography.hazmat.primitives import serialization, padding, hashes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography import x509
 from cryptography.x509.oid import ExtensionOID, NameOID, AuthorityInformationAccessOID
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # Local imports
 from Communications import (
@@ -78,8 +80,27 @@ class Client:
         self._connection_timeout = 30
         self._message_timeout = 300
         self._max_message_size = 1024 * 1024
-        self._secure_storage = SecureStorage()  # Centralized secure storage
-        self._state_lock = threading.Lock()
+        
+        # Initialize secure storage ONCE
+        self._secure_storage = SecureStorage()
+        
+        # Initialize state
+        self._state = {
+            'connection_state': 'disconnected',
+            'session_established': False,
+            'key_exchange_complete': False,
+            'certificate_verified': False,
+            'last_server_sequence': 0,
+            'messages_sent': 0,
+            'messages_received': 0,
+            'last_key_renewal': 0,
+            'encryption_failures': 0,
+            'reconnection_attempts': 0,
+            'last_activity': time.time()
+        }
+        
+        # Initialize locks ONCE
+        self._state_lock = threading.RLock()  # Use RLock for state operations
         self._send_lock = threading.Lock()
         self._key_lock = threading.Lock()
         self._storage_lock = threading.Lock()
@@ -87,7 +108,8 @@ class Client:
         self._activity_lock = threading.Lock()
         
         # Initialize managers
-        self.key_manager = KeyManagement()
+        self.secure_storage = SecureStorage()
+        self.key_manager = KeyManagement(self.secure_storage)
         self.nonce_manager = NonceManager()
         self.sequence_manager = SequenceManager()
         self._connected = False
@@ -102,7 +124,7 @@ class Client:
         self.retry_delay = 1  # seconds
         self._last_activity = 0
         self._activity_timeout = 300  # 5 minutes
-        self._heartbeat_interval = 60  # 1 minute
+        self._heartbeat_interval = 15  # Send heartbeat every 15 seconds
         self._heartbeat_thread = None
         self._cleanup_thread = None
         self._cleanup_interval = 30  # 30 seconds
@@ -128,21 +150,6 @@ class Client:
             'max_delay': 10
         }
         
-        # State management
-        self._state = {
-            'connection_state': 'disconnected',  # disconnected, connecting, connected, terminating
-            'session_established': False,
-            'key_exchange_complete': False,
-            'certificate_verified': False,
-            'last_server_sequence': 0,
-            'messages_sent': 0,
-            'messages_received': 0,
-            'last_key_renewal': 0,
-            'encryption_failures': 0,
-            'reconnection_attempts': 0
-        }
-        self._state_lock = threading.RLock()  # Reentrant lock for state operations
-        
         # Resource tracking
         self._resources = {
             'socket': None,
@@ -152,7 +159,6 @@ class Client:
             'buffers': []
         }
         self._resource_lock = threading.Lock()
-
     def register_error_handler(self, handler):
         """Register callback for error notifications."""
         with self._handler_lock:
@@ -182,41 +188,63 @@ class Client:
                     log_error(ErrorCode.CALLBACK_ERROR, f"State change handler failed: {e}")
 
     def set_session_key(self, key: bytes):
-        """Thread-safe session key storage."""
-        with self._key_lock:
+        """Store the session key securely."""
+        try:
+            log_event("Security", "[SECURE_SESSION] Storing session key")
             with self._storage_lock:
-                self._secure_storage.store('session_key', {
-                    'key': key,
-                    'created_at': time.time(),
-                    'last_used': time.time(),
-                    'encryption_failures': 0
-                })
-            log_event("Session", "Session key updated")
-            self._notify_state_change(True)
+                # Convert the data to bytes using JSON
+                key_data = json.dumps({
+                    'key': key.hex(),  # Convert bytes to hex string
+                    'timestamp': int(time.time())
+                }).encode('utf-8')
+                self._secure_storage.store('session_key', key_data)
+            log_event("Security", "[SECURE_SESSION] Session key stored successfully")
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"[SECURE_SESSION] Failed to store session key: {str(e)}")
+            raise
 
     def get_session_key(self) -> Optional[bytes]:
-        """Thread-safe session key retrieval."""
-        with self._key_lock:
+        """Retrieve the session key."""
+        try:
             with self._storage_lock:
                 key_data = self._secure_storage.retrieve('session_key')
                 if key_data:
-                    key_data['last_used'] = time.time()
-                    self._secure_storage.store('session_key', key_data)
-                    return key_data['key']
-                return None
+                    # Parse the JSON data
+                    data_dict = json.loads(key_data.decode('utf-8'))
+                    # Convert hex string back to bytes
+                    return bytes.fromhex(data_dict['key'])
+            return None
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"[SECURE_SESSION] Failed to retrieve session key: {str(e)}")
+            return None
 
     def is_connected(self) -> bool:
-        """Check if client has active connection with activity tracking."""
+        """Check if client has active connection."""
         with self._state_lock:
-            key_data = self._secure_storage.retrieve('session_key')
-            last_activity = self._secure_storage.retrieve('last_activity') or 0
-            current_time = time.time()
-
-            return (self._connected and 
-                    self.socket is not None and 
-                    key_data is not None and
-                    current_time - key_data['created_at'] < 3600 and  # 1 hour max key age
-                    current_time - last_activity < self._activity_timeout)  # Check activity timeout
+            try:
+                if not self._connected or not self.socket:
+                    return False
+                    
+                # Check socket validity
+                original_timeout = self.socket.gettimeout()
+                try:
+                    self.socket.settimeout(1)
+                    # Try to read with zero length to check connection
+                    self.socket.recv(0)
+                    return True
+                except socket.timeout:
+                    # Timeout is okay - connection is still alive
+                    return True
+                except Exception:
+                    # Other errors indicate connection issues
+                    return False
+                finally:
+                    # Restore original timeout
+                    if self.socket:
+                        self.socket.settimeout(original_timeout)
+                
+            except Exception:
+                return False
 
     def _perform_with_timeout(self, operation, timeout_key, *args, **kwargs):
         """Execute operation with timeout and retry logic."""
@@ -246,40 +274,231 @@ class Client:
         
         raise TimeoutError(f"Operation failed after {retries} retries: {last_error}")
 
-    def establish_secure_session(self, destination: Tuple[str, int]) -> bool:
-        """Establish secure session with proper timeout handling."""
+    def _connect_to_server(self, destination: Tuple[str, int]):
+        """Establish initial TCP connection to server."""
         try:
-            # Connect with timeout
-            self._perform_with_timeout(
-                self._connect_to_server,
-                'connect',
-                destination
-            )
-            
-            # Perform TLS handshake with timeout
-            self._perform_with_timeout(
-                self._perform_tls_handshake,
-                'handshake'
-            )
-            
-            # Perform key exchange with timeout
-            self._perform_with_timeout(
-                self._perform_key_exchange,
-                'key_exchange'
-            )
-            
-            # Verify server identity with timeout
-            self._perform_with_timeout(
-                self._verify_server_identity,
-                'verification'
-            )
-            
+            log_event("Connection", f"Attempting to connect to {destination[0]}:{destination[1]}")
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(self._operation_timeouts['connect'])  # Set timeout directly
+            self.socket.connect(destination)
+            log_event("Connection", "TCP connection established successfully")
             return True
+        except Exception as e:
+            log_error(ErrorCode.CONNECTION_ERROR, f"Failed to connect to server: {e}")
+            return False
+
+    def _perform_key_exchange(self):
+        """Perform basic key exchange for non-TLS connections."""
+        try:
+            log_event("Session", "Performing basic key exchange")
+            # For non-TLS connections, we'll use a simplified session key
+            session_key = os.urandom(32)  # Generate a 256-bit session key
+            self.key_manager.set_session_key('default', session_key)
+            return True
+        except Exception as e:
+            log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange failed: {e}")
+            return False
+
+    def establish_secure_session(self, destination: Tuple[str, int]) -> bool:
+        """Establish a secure session with the server."""
+        try:
+            log_event("Session", f"[SECURE_SESSION] Starting secure session establishment with {destination[0]}:{destination[1]}")
+            
+            # Store destination for later use
+            self.destination = destination
+            log_event("Session", f"[SECURE_SESSION] Stored destination: {destination}")
+            
+            # Create socket
+            try:
+                log_event("Session", "[SECURE_SESSION] Creating new socket")
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                log_event("Session", "[SECURE_SESSION] Socket created successfully")
+                
+                log_event("Session", f"[SECURE_SESSION] Setting socket timeout to {self._connection_timeout}s")
+                self.socket.settimeout(self._connection_timeout)
+                log_event("Session", f"[SECURE_SESSION] Socket timeout set successfully")
+                
+                log_event("Session", f"[SECURE_SESSION] Attempting connection to {destination[0]}:{destination[1]}")
+                self.socket.connect(destination)
+                log_event("Session", "[SECURE_SESSION] TCP connection established successfully")
+                
+                # Log socket details
+                local_addr = self.socket.getsockname()
+                log_event("Session", f"[SECURE_SESSION] Local endpoint: {local_addr[0]}:{local_addr[1]}")
+                log_event("Session", f"[SECURE_SESSION] Remote endpoint: {destination[0]}:{destination[1]}")
+                
+            except Exception as e:
+                log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] Failed to create/connect socket: {str(e)}")
+                log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] Exception type: {type(e)}")
+                raise
+            
+            # Set connected flag and update state
+            log_event("Session", "[SECURE_SESSION] Updating connection state to connected")
+            self._connected = True
+            log_event("Session", "[SECURE_SESSION] Setting initial connection state")
+            
+            log_event("State", "[SECURE_SESSION] Preparing state update")
+            state_update = {
+                'connection_active': True,
+                'last_activity': time.time()
+            }
+            log_event("State", f"[SECURE_SESSION] State update prepared: {state_update}")
+            
+            self._update_state(state_update)
+            log_event("Session", "[SECURE_SESSION] Connection state updated successfully")
+            
+            # Generate key pair for key exchange
+            try:
+                log_event("Security", "[SECURE_SESSION] Starting key pair generation")
+                log_event("Security", "[SECURE_SESSION] Calling Crypto.generate_key_pair()")
+                public_pem, private_pem = Crypto.generate_key_pair()
+                log_event("Security", "[SECURE_SESSION] Key pair generated successfully")
+                log_event("Security", f"[SECURE_SESSION] Public key size: {len(public_pem)} bytes")
+                
+                # Load the PEM keys into key objects
+                log_event("Security", "[SECURE_SESSION] Loading private key from PEM")
+                private_key = serialization.load_pem_private_key(
+                    private_pem,
+                    password=None,
+                    backend=default_backend()
+                )
+                log_event("Security", "[SECURE_SESSION] Private key loaded successfully")
+                log_event("Security", f"[SECURE_SESSION] Private key type: {type(private_key).__name__}")
+                
+            except Exception as e:
+                log_error(ErrorCode.CRYPTO_ERROR, f"[SECURE_SESSION] Key generation/loading failed: {str(e)}")
+                log_error(ErrorCode.CRYPTO_ERROR, f"[SECURE_SESSION] Exception type: {type(e)}")
+                raise
+            
+            # Perform key exchange
+            try:
+                log_event("Security", "[SECURE_SESSION] Starting key exchange process")
+                log_event("Security", "[SECURE_SESSION] Preparing key exchange message")
+                
+                # Generate nonce
+                log_event("Security", "[SECURE_SESSION] Generating nonce for key exchange")
+                nonce = self.nonce_manager.generate_nonce()
+                log_event("Security", f"[SECURE_SESSION] Generated nonce: {nonce[:8]}...")
+                
+                # Get current timestamp
+                timestamp = int(time.time())
+                log_event("Security", f"[SECURE_SESSION] Using timestamp: {timestamp}")
+                
+                # Prepare message
+                key_exchange_message = {
+                    'type': MessageType.KEY_EXCHANGE.value,
+                    'nonce': nonce,
+                    'timestamp': timestamp,
+                    'client_id': str(id(self)),
+                    'public_key': public_pem.decode('utf-8')
+                }
+                log_event("Security", "[SECURE_SESSION] Key exchange message prepared")
+                log_event("Security", f"[SECURE_SESSION] Message type: {key_exchange_message['type']}")
+                log_event("Security", f"[SECURE_SESSION] Client ID: {key_exchange_message['client_id']}")
+                
+                # Convert to bytes
+                log_event("Security", "[SECURE_SESSION] Converting message to JSON")
+                message_bytes = json.dumps(key_exchange_message).encode('utf-8')
+                log_event("Security", f"[SECURE_SESSION] Message size: {len(message_bytes)} bytes")
+                
+                # Send key exchange request
+                log_event("Security", "[SECURE_SESSION] Sending key exchange request")
+                sendData(self.socket, message_bytes)
+                log_event("Security", "[SECURE_SESSION] Key exchange request sent successfully")
+                
+                # Wait for response
+                log_event("Security", f"[SECURE_SESSION] Setting socket timeout to {self._operation_timeouts['key_exchange']}s for response")
+                self.socket.settimeout(self._operation_timeouts['key_exchange'])
+                log_event("Security", "[SECURE_SESSION] Waiting for key exchange response")
+                
+                response_data = receiveData(self.socket)
+                if not response_data:
+                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, "[SECURE_SESSION] No response received")
+                    raise SecurityError("No response received during key exchange")
+                
+                log_event("Security", f"[SECURE_SESSION] Received response: {len(response_data)} bytes")
+                
+                # Parse response
+                log_event("Security", "[SECURE_SESSION] Parsing response JSON")
+                response = json.loads(response_data.decode('utf-8'))
+                log_event("Security", f"[SECURE_SESSION] Response type: {response.get('type')}")
+                
+                # Validate response type
+                if response.get('type') != MessageType.KEY_EXCHANGE_RESPONSE.value:
+                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, 
+                             f"[SECURE_SESSION] Invalid response type: {response.get('type')}")
+                    raise SecurityError("Invalid response type during key exchange")
+                
+                # Load server's public key
+                log_event("Security", "[SECURE_SESSION] Loading server's public key")
+                server_public_key = serialization.load_pem_public_key(
+                    response['public_key'].encode('utf-8'),
+                    backend=default_backend()
+                )
+                log_event("Security", "[SECURE_SESSION] Server public key loaded")
+
+                # Perform ECDH to derive shared secret
+                log_event("Security", "[SECURE_SESSION] Performing ECDH key exchange")
+                shared_key = private_key.exchange(
+                    ec.ECDH(),
+                    server_public_key
+                )
+                log_event("Security", "[SECURE_SESSION] ECDH exchange completed")
+
+                # Derive session key using HKDF
+                log_event("Security", "[SECURE_SESSION] Deriving session key using HKDF")
+                session_key = HKDF(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=None,
+                    info=b'session key',
+                    backend=default_backend()
+                ).derive(shared_key)
+                log_event("Security", f"[SECURE_SESSION] Session key derived, size: {len(session_key)} bytes")
+
+                # Store session key
+                try:
+                    log_event("Security", "[SECURE_SESSION] Storing session key")
+                    self.key_manager.set_session_key('default', session_key)
+                    self.set_session_key(session_key)
+                    log_event("Security", "[SECURE_SESSION] Session key stored successfully")
+                except Exception as e:
+                    log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"[SECURE_SESSION] Failed to store session key: {str(e)}")
+                    raise
+                
+                # Start monitoring
+                log_event("Connection", "[SECURE_SESSION] Starting connection monitoring threads")
+                self.start_connection_monitoring()
+                log_event("Connection", "[SECURE_SESSION] Connection monitoring started successfully")
+                
+                # Update session state
+                log_event("State", "[SECURE_SESSION] Updating final session state")
+                self._update_state({
+                    'session_established': True,
+                    'key_exchange_complete': True
+                })
+                log_event("Session", "[SECURE_SESSION] Session state updated - secure session established")
+                
+                log_event("Session", "[SECURE_SESSION] Secure session establishment completed successfully")
+                return True
+                
+            except socket.timeout:
+                log_error(ErrorCode.TIMEOUT_ERROR, "[SECURE_SESSION] Key exchange timed out")
+                log_error(ErrorCode.TIMEOUT_ERROR, f"[SECURE_SESSION] Timeout value: {self._operation_timeouts['key_exchange']}s")
+                raise SecurityError("Key exchange timed out")
             
         except Exception as e:
-            log_error(ErrorCode.SESSION_ERROR, f"Session establishment failed: {e}")
-            self.terminate_session()
+            log_error(ErrorCode.CONNECTION_ERROR, f"[SECURE_SESSION] Failed to establish secure session: {str(e)}")
+            log_error(ErrorCode.CONNECTION_ERROR, f"[SECURE_SESSION] Exception type: {type(e)}")
+            log_error(ErrorCode.CONNECTION_ERROR, "[SECURE_SESSION] Stack trace:", exc_info=True)
+            self._cleanup_connection()
             return False
+        finally:
+            # Restore default timeout
+            if self.socket:
+                log_event("Session", f"[SECURE_SESSION] Restoring default socket timeout to {self._connection_timeout}s")
+                self.socket.settimeout(self._connection_timeout)
+                log_event("Session", "[SECURE_SESSION] Socket timeout restored")
 
     def _secure_clear_bytes(self, data: bytes):
         """Securely clear sensitive bytes from memory."""
@@ -298,13 +517,22 @@ class Client:
         """Comprehensive cleanup of session resources."""
         with self._state_lock:
             try:
+                # Stop listening first
+                self.stop_listening()
+                
+                # Set flags to stop all monitoring threads
+                self.running = False
+                self.listening = False
+                
                 # Clear secure storage
                 self._secure_storage.clear()
                 
                 # Close socket
                 if self.socket:
                     try:
-                        self.socket.shutdown(socket.SHUT_RDWR)
+                        # Only shutdown if socket is still connected
+                        if self.is_connected():
+                            self.socket.shutdown(socket.SHUT_RDWR)
                     except Exception:
                         pass
                     try:
@@ -318,16 +546,67 @@ class Client:
                 self.sequence_manager.reset()
                 self.nonce_manager.cleanup_old_nonces()
                 
+                # Wait for monitoring threads to finish
+                if self.listen_thread and self.listen_thread.is_alive():
+                    self.listen_thread.join(timeout=2)
+                if hasattr(self, 'heartbeat_thread') and self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                    self.heartbeat_thread.join(timeout=2)
+                
             except Exception as e:
                 log_error(ErrorCode.CLEANUP_ERROR, f"Resource cleanup failed: {e}")
 
     def send_message(self, message: str) -> bool:
-        """Send message with timeout handling."""
-        return self._perform_with_timeout(
-            self._send_message_internal,
-            'send',
-            message
-        )
+        """Send an encrypted message to the server."""
+        try:
+            if not self.is_connected():
+                log_error(ErrorCode.CONNECTION_ERROR, "Cannot send message - not connected")
+                return False
+
+            # Get the session key from key manager
+            session_key = self.key_manager.get_session_key('default')
+            if not session_key:
+                log_error(ErrorCode.SECURITY_ERROR, "No session key available")
+                return False
+
+            # Convert message to bytes
+            message_bytes = message.encode('utf-8')
+
+            # Create Crypto instance and encrypt the message
+            try:
+                encrypted_message = Crypto.encrypt(
+                    data=message_bytes,
+                    key=session_key,
+                    associated_data=b'message'
+                )
+                log_event("Security", "[CLIENT] Message encrypted successfully")
+            except Exception as e:
+                log_error(ErrorCode.CRYPTO_ERROR, f"Failed to encrypt message: {str(e)}")
+                return False
+
+            # Package the encrypted message
+            message_data = {
+                'type': MessageType.DATA.value,
+                'encryptedMessage': encrypted_message.ciphertext.hex(),
+                'nonce': encrypted_message.nonce.hex(),
+                'tag': encrypted_message.tag.hex(),
+                'version': encrypted_message.version,
+                'timestamp': int(time.time()),
+                'sender_id': str(id(self)),
+                'sequence': self.sequence_manager.get_next_sequence()
+            }
+
+            # Sign the message data
+            message_data['signature'] = self._sign_message(message_data)  # Add signature
+
+            # Send the message
+            message_bytes = json.dumps(message_data).encode('utf-8')
+            sendData(self.socket, message_bytes)
+            log_event("Communication", f"Sent encrypted message of {len(message_bytes)} bytes")
+            return True
+
+        except Exception as e:
+            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {str(e)}")
+            return False
 
     def _handle_encryption_failure(self):
         """Thread-safe encryption failure handling with error propagation."""
@@ -511,7 +790,11 @@ class Client:
     def terminate_session(self):
         """Enhanced session termination with state and resource cleanup."""
         try:
-            self._update_state(connection_state='terminating')
+            self._update_state({
+                'connection_active': False,
+                'session_established': False,
+                'key_exchange_complete': False
+            })
             
             # Stop all monitoring threads
             self._cleanup_resources()
@@ -538,31 +821,32 @@ class Client:
             raise
 
     def start_listening(self):
-        """
-        Starts a background thread to listen for incoming messages.
-        """
-        if self.listening:
-            log_event("Error", "Already listening for messages.")
-            return
-
+        """Start listening for server messages."""
         self.listening = True
-        self.listen_thread = threading.Thread(target=self.receive_messages)
+        self.listen_thread = threading.Thread(target=self._listen_loop)
         self.listen_thread.daemon = True
         self.listen_thread.start()
-        log_event("Listening", "Started listening for incoming messages.")
+        log_event("Communication", "Started listening for server messages")
 
     def stop_listening(self):
-        """
-        Stops listening for incoming messages.
-        """
-        if not self.listening:
-            log_event("Error", "Not currently listening.")
-            return
-
+        """Stop listening for server messages."""
         self.listening = False
         if self.listen_thread:
-            self.listen_thread.join()
-        log_event("Listening", "Stopped listening for incoming messages.")
+            self.listen_thread.join(timeout=2)
+        log_event("Communication", "Stopped listening for server messages")
+
+    def _listen_loop(self):
+        """Listen for incoming server messages."""
+        while self.listening and self.is_connected():
+            try:
+                data = receiveData(self.socket)
+                if data:
+                    # Add debug logging
+                    log_event("Communication", f"Received server message: {data}")
+                    self.process_server_message(data)
+            except Exception as e:
+                if self.listening:  # Only log if we're still meant to be listening
+                    log_error(ErrorCode.NETWORK_ERROR, f"Error receiving server message: {e}")
 
     def _validate_server_certificate_and_identity(self, hostname: str) -> None:
         """
@@ -647,69 +931,74 @@ class Client:
             if hostname != common_name:
                 raise ValueError(f"Hostname {hostname} doesn't match certificate")
 
-    def process_server_message(self, message_data: dict):
-        """Thread-safe message processing with error propagation."""
+    def process_server_message(self, data: bytes):
+        """Process received server message."""
         try:
-            with self._activity_lock:
-                self._update_activity_timestamp()
+            # First try to decode as JSON for basic messaging
+            try:
+                message_data = json.loads(data.decode('utf-8'))
+                
+                # Handle basic message type
+                if isinstance(message_data, dict) and message_data.get('type') == 'response':
+                    log_event("Communication", f"Received server response: {message_data['content']}")
+                    return
+                    
+            except json.JSONDecodeError:
+                # Not a JSON message, try parsing as a secure message
+                pass
+                
+            # Parse and validate the secure message
+            message = parseMessage(data)
             
-            if not self._validate_message(message_data):
-                error_msg = "Message validation failed"
-                self._notify_error(ErrorCode.VALIDATION_ERROR, error_msg)
+            # Validate timestamp
+            timestamp = message.get('timestamp', 0)
+            current_time = int(time.time())
+            
+            # Reject messages older than 5 minutes or future messages
+            if abs(current_time - timestamp) > 300:
+                log_error(ErrorCode.VALIDATION_ERROR, "Message timestamp outside acceptable range")
                 return
-
-            if not self.is_connected():
-                error_msg = "Not connected to server"
-                self._notify_error(ErrorCode.STATE_ERROR, error_msg)
-                return
+                
+            message_type = message.get('type')
             
-            message_type = message_data.get('type')
-            
-            # Verify signature before processing any message
-            if not self._verify_message_signature(message_data):
-                error_msg = "Invalid message signature"
-                self._notify_error(ErrorCode.SECURITY_ERROR, error_msg)
-                return
-            
+            # Handle different message types using enum
             if message_type == MessageType.ACKNOWLEDGE.value:
-                log_event("Message", "Server acknowledged message receipt")
+                log_event("Communication", "Received server acknowledgment")
                 
-            elif message_type == MessageType.SERVER_RESPONSE.value:
-                self._handle_server_response(message_data)
+            elif message_type == MessageType.DATA.value:
+                decrypted_message = self._handle_data_message(message)
+                if decrypted_message and hasattr(self, 'message_handler') and self.message_handler:
+                    self.message_handler(decrypted_message.decode('utf-8'))
                 
-            elif message_type == MessageType.ERROR.value:
-                self._handle_error_response(message_data)
-                
-            elif message_type == MessageType.KEY_RENEWAL_RESPONSE.value:
-                self._handle_key_renewal_response(message_data)
+            elif message_type == MessageType.KEY_RENEWAL_REQUEST.value:
+                self._handle_key_renewal_request(message)
                 
             elif message_type == MessageType.SESSION_TERMINATION.value:
-                log_event("Connection", "Received session termination from server")
-                self.terminate_session()
+                self._handle_termination_request()
+                
+            elif message_type == MessageType.ERROR.value:
+                error_msg = message.get('encryptedMessage', 'Unknown error')
+                log_error(ErrorCode.SERVER_ERROR, f"Error from server: {error_msg}")
                 
             else:
-                error_msg = f"Unknown message type: {message_type}"
-                self._notify_error(ErrorCode.VALIDATION_ERROR, error_msg)
+                log_error(ErrorCode.VALIDATION_ERROR, f"Unknown message type: {message_type}")
                 
         except Exception as e:
-            error_msg = f"Error processing server message: {e}"
-            self._notify_error(ErrorCode.GENERAL_ERROR, error_msg)
-            self._check_connection_state()
-            raise
+            log_error(ErrorCode.GENERAL_ERROR, f"Error processing message: {e}")
 
     def _verify_message_signature(self, message: dict) -> bool:
         """Verify message signature and integrity."""
         try:
             # Create signature payload including all critical fields
             signature_payload = {
-                'encryptedMessage': message.get('encryptedMessage', ''),
-                'nonce': message.get('nonce', ''),
-                'timestamp': message.get('timestamp', 0),
-                'type': message.get('type', ''),
-                'sequence': message.get('sequence', 0),
-                'sender_id': message.get('sender_id', 'server'),
-                'iv': message.get('iv', ''),
-                'tag': message.get('tag', '')
+            'encryptedMessage': message.get('encryptedMessage', ''),
+            'nonce': message.get('nonce', ''),
+            'timestamp': message.get('timestamp', 0),
+            'type': message.get('type', ''),
+            'sequence': message.get('sequence', 0),
+            'sender_id': message.get('sender_id', 'server'),
+            'iv': message.get('iv', ''),
+            'tag': message.get('tag', '')
             }
             
             signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
@@ -750,7 +1039,7 @@ class Client:
                 iv=iv,
                 tag=tag
             )
-            
+                        
             decrypted_message = Crypto.decrypt(secure_msg, session_key)
             
             # Process decrypted message
@@ -844,13 +1133,13 @@ class Client:
             if not self.sequence_manager.validate_sequence(sequence, sender_id):
                 log_error(ErrorCode.VALIDATION_ERROR, "Invalid message sequence")
                 return False
-            
+
             # Validate nonce
             nonce = message.get('nonce')
             if not self.nonce_manager.validate_nonce(nonce):
                 log_error(ErrorCode.VALIDATION_ERROR, "Invalid or reused nonce")
                 return False
-            
+
             # Validate message type
             message_type = message.get('type')
             if not message_type or not isinstance(message_type, str):
@@ -861,7 +1150,7 @@ class Client:
             if len(str(message)) > self._max_message_size:
                 log_error(ErrorCode.VALIDATION_ERROR, "Message exceeds maximum size")
                 return False
-            
+
             return True
             
         except Exception as e:
@@ -977,48 +1266,74 @@ class Client:
 
     def start_connection_monitoring(self):
         """Start connection monitoring threads."""
-        # Start heartbeat thread
-        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
-        self._heartbeat_thread.daemon = True
-        self._heartbeat_thread.start()
+        try:
+            # Start heartbeat thread
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+            self._heartbeat_thread.daemon = True
+            self._heartbeat_thread.start()
+            self._track_resource('thread', self._heartbeat_thread)
 
-        # Start cleanup thread
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop)
-        self._cleanup_thread.daemon = True
-        self._cleanup_thread.start()
+            # Start cleanup thread
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop)
+            self._cleanup_thread.daemon = True
+            self._cleanup_thread.start()
+            self._track_resource('thread', self._cleanup_thread)
+            
+            log_event("Connection", "Connection monitoring started")
+            
+        except Exception as e:
+            log_error(ErrorCode.THREAD_ERROR, f"Failed to start monitoring threads: {e}")
+            raise
 
     def _update_activity_timestamp(self):
-        """Thread-safe activity timestamp update."""
-        with self._activity_lock:
-            self._last_activity = time.time()
+        """Update the last activity timestamp."""
+        try:
+            current_time = time.time()
+            with self._state_lock:
+                self._state['last_activity'] = current_time
+                self._persist_state()
             with self._storage_lock:
-                self._secure_storage.store('last_activity', self._last_activity)
+                self._secure_storage.store('last_activity', current_time)
+            log_event("Connection", "Activity timestamp updated")
+        except Exception as e:
+            log_error(ErrorCode.STATE_ERROR, f"Failed to update activity timestamp: {e}")
 
     def _heartbeat_loop(self):
         """Send periodic heartbeats to keep connection alive."""
+        log_event("Connection", "Starting heartbeat loop")
         while self.is_connected():
             try:
+                if not self._connected:  # Check before sleep
+                    break
+                    
                 time.sleep(self._heartbeat_interval)
-                self._send_heartbeat()
+                
+                heartbeat_message = {
+                    'encryptedMessage': '',
+                    'signature': '',
+                    'nonce': self.nonce_manager.generate_nonce(),
+                    'timestamp': int(time.time()),
+                    'type': MessageType.KEEPALIVE.value,
+                    'sequence': self.sequence_manager.get_next_sequence(),
+                    'sender_id': str(id(self))
+                }
+                
+                message_bytes = json.dumps(heartbeat_message).encode('utf-8')
+                
+                with self._send_lock:
+                        try:
+                            sendData(self.socket, message_bytes)  # Send raw bytes
+                            self._update_activity_timestamp()
+                            log_event("Connection", "Heartbeat sent successfully")
+                        except Exception as e:
+                            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send heartbeat: {e}")
+                            raise
+                    
             except Exception as e:
                 log_error(ErrorCode.NETWORK_ERROR, f"Heartbeat failed: {e}")
-
-    def _send_heartbeat(self):
-        """Send heartbeat message to server."""
-        try:
-            heartbeat_message = packageMessage(
-                encryptedMessage='',
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=int(time.time()),
-                type=MessageType.HEARTBEAT.value
-            )
-            with self._send_lock:
-                sendData(self.socket, heartbeat_message)
-            self._update_activity_timestamp()
-        except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send heartbeat: {e}")
-            self._check_connection_state()
+                if self.is_connected():
+                    self._handle_send_failure()
+                    break  # Exit loop on failure
 
     def _cleanup_loop(self):
         """Periodically check and cleanup stale connection state."""
@@ -1056,30 +1371,71 @@ class Client:
                 log_error(ErrorCode.CONNECTION_ERROR, "Socket verification failed")
                 self.terminate_session()
 
-    def _update_state(self, **kwargs):
-        """Thread-safe state update with validation."""
+    def _update_state(self, state_updates: dict):
+        """Update client state in a thread-safe manner."""
         with self._state_lock:
-            for key, value in kwargs.items():
-                if key not in self._state:
-                    log_error(ErrorCode.STATE_ERROR, f"Invalid state key: {key}")
-                    continue
-                self._state[key] = value
-                log_event("State", f"State updated: {key}={value}")
+            # Define valid state keys
+            valid_keys = {
+                'connected',
+                'session_established',
+                'key_exchange_complete',
+                'last_activity',
+                'connection_active',  # Use this instead of connection_state
+                'last_server_sequence',
+                'messages_received',
+                'last_key_renewal'
+            }
+            
+            log_event("State", f"[CLIENT] Updating state with keys: {list(state_updates.keys())}")
+            
+            # Validate and update state
+            for key, value in state_updates.items():
+                if key in valid_keys:
+                    self._state[key] = value
+                    log_event("State", f"[CLIENT] Updated state key '{key}' to {value}")
+                else:
+                    log_error(ErrorCode.STATE_ERROR, 
+                             f"[CLIENT] Invalid state key: {key}")
+                
             self._persist_state()
+            log_event("State", "[CLIENT] State persisted successfully")
 
-    def _persist_state(self):
-        """Persist current state to secure storage."""
-        with self._state_lock:
+    def _cleanup_connection(self):
+        """Clean up connection resources."""
+        try:
+            if hasattr(self, 'socket') and self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+                
+            self._connected = False  # Ensure connected flag is cleared
+            
+            # Update state using dictionary format
+            self._update_state({
+                'connection_active': False,
+                'session_established': False,
+                'key_exchange_complete': False
+            })
+            
+            # Clear session key
             with self._storage_lock:
-                self._secure_storage.store('client_state', self._state)
-
-    def _restore_state(self):
-        """Restore state from secure storage."""
-        with self._state_lock:
-            with self._storage_lock:
-                stored_state = self._secure_storage.retrieve('client_state')
-                if stored_state:
-                    self._state.update(stored_state)
+                self._secure_storage.remove('session_key')
+                
+            log_event("Connection", "[CLIENT] Cleaning up connection state")
+            self._update_state({
+                'connection_active': False,
+                'session_established': False,
+                'key_exchange_complete': False
+            })
+            log_event("Connection", "[CLIENT] Connection state cleaned up")
+        except Exception as e:
+            log_error(ErrorCode.RESOURCE_ERROR, f"Error during connection cleanup: {e}")
 
     def _verify_state_consistency(self) -> bool:
         """Verify state consistency with server."""
@@ -1180,3 +1536,106 @@ class Client:
                 except Exception:
                     pass
                 self._resources['socket'] = None
+
+    def _perform_tls_handshake(self):
+        """Perform TLS handshake with server."""
+        try:
+            log_event("Security", "Starting TLS handshake")
+            
+            # Create TLS context
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            
+            # Configure TLS settings
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = True
+            
+            # Load certificates if provided
+            if hasattr(self, 'tls_config') and self.tls_config:
+                if self.tls_config.cert_path:
+                    context.load_cert_chain(
+                        certfile=str(self.tls_config.cert_path),
+                        keyfile=str(self.tls_config.key_path)
+                    )
+                if self.tls_config.ca_path:
+                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
+            
+            # Wrap socket with TLS
+            hostname = self.destination[0] if hasattr(self, 'destination') else None
+            self.socket = context.wrap_socket(
+                self.socket,
+                server_hostname=hostname
+            )
+            
+            log_event("Security", "TLS handshake completed successfully")
+            return True
+            
+        except ssl.SSLError as e:
+            log_error(ErrorCode.SECURITY_ERROR, f"TLS handshake failed: {e}")
+            return False
+        except Exception as e:
+            log_error(ErrorCode.SECURITY_ERROR, f"TLS setup failed: {e}")
+            return False
+
+    def _sign_message(self, message_data: dict) -> str:
+        """Sign message data using the client's signing key."""
+        try:
+            # Create signature payload with relevant fields
+            signature_payload = {
+                'sequence': message_data.get('sequence'),
+                'encryptedMessage': message_data.get('encryptedMessage'),
+                'nonce': message_data.get('nonce'),
+                'timestamp': message_data.get('timestamp'),
+                'type': message_data.get('type')
+            }
+            
+            # Convert to bytes in a consistent format
+            signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
+            
+            # Get signing key from key manager and use Crypto to sign
+            signing_key = self.key_manager.get_signing_key()
+            signature = Crypto.sign(data=signature_bytes, private_key=signing_key)
+            return signature.hex()
+            
+        except Exception as e:
+            log_error(ErrorCode.SECURITY_ERROR, f"Failed to sign message: {e}")
+            raise
+
+    def _persist_state(self):
+        """Persist current state to secure storage."""
+        try:
+            with self._state_lock:
+                # Convert state to JSON-serializable format
+                serializable_state = {}
+                for key, value in self._state.items():
+                    if isinstance(value, (str, int, float, bool, list, dict)):
+                        serializable_state[key] = value
+                    else:
+                        # Convert non-serializable types to string representation
+                        serializable_state[key] = str(value)
+                
+                # Convert to bytes before storing
+                state_bytes = json.dumps(serializable_state).encode('utf-8')
+                self._secure_storage.store('client_state', state_bytes)
+                log_event("State", "Client state persisted successfully")
+                
+        except Exception as e:
+            log_error(ErrorCode.STATE_ERROR, f"Failed to persist state: {e}")
+
+    def _encrypt_message(self, message: bytes) -> SecureMessage:
+        """Encrypt a message using the session key."""
+        try:
+            session_key = self.get_session_key()
+            if not session_key:
+                raise SecurityError("No session key available")
+            
+            # Remove associated_data parameter since it's not supported
+            encrypted_message = Crypto.encrypt(
+                data=message,
+                key=session_key
+            )
+            return encrypted_message
+        except Exception as e:
+            log_error(ErrorCode.CRYPTO_ERROR, f"Failed to encrypt message: {e}")
+            raise
+
