@@ -552,9 +552,9 @@ class TestKeyManagement:
             # Take minimum of multiple measurements to reduce noise
             measurements = []
             for _ in range(3):
-                start = time.perf_counter_ns()
-                key_manager.verify_signature(mock_public_key, test_message, b"valid_signature")
-                end = time.perf_counter_ns()
+            start = time.perf_counter_ns()
+            key_manager.verify_signature(mock_public_key, test_message, b"valid_signature")
+            end = time.perf_counter_ns()
                 measurements.append(end - start)
             times.append(min(measurements))
         
@@ -686,7 +686,7 @@ class TestKeyManagement:
             mock_crypto.derive_session_key.return_value = b"derived_session_key"
             
         # Test key generation
-            private_key, public_key = key_manager.initiate_key_renewal()
+        private_key, public_key = key_manager.initiate_key_renewal()
             assert private_key == mock_private_key
             assert public_key == mock_public_key
         
@@ -699,7 +699,7 @@ class TestKeyManagement:
         # Test key renewal scheduling
         def check_renewal():
                 initial_keys = key_manager.current_session_keys.copy()
-                time.sleep(2)  # Wait for potential renewal
+            time.sleep(2)  # Wait for potential renewal
                 return key_manager.current_session_keys != initial_keys
             
         key_manager.schedule_key_renewal(1)  # 1 second interval
@@ -964,7 +964,7 @@ class TestKeyManagement:
         with patch('builtins.open', mock_file):
             for _ in range(100):
                 try:
-                    key_manager.load_certificate("test.pem")
+                key_manager.load_certificate("test.pem")
                 except Exception:
                     # Expected since mock cert data isn't valid
                     pass
