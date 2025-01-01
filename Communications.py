@@ -100,6 +100,7 @@ class MessageType(Enum):
     SESSION_TERMINATION = "sessionTermination"
     ACKNOWLEDGE = "acknowledge"
     ERROR = "error"
+    SERVER_RESPONSE = "serverResponse"
 
 def packageMessage(encryptedMessage, signature, nonce, timestamp, type="data", iv="", tag="", sender_id="system", format="json", compression=None, protocol_version="2.0"):
     """Package message with sequence number for replay protection."""

@@ -195,7 +195,7 @@ class Client:
 
         while self.listening:
             try:
-                received_package = receiveData(self.socket)  # Pass the connected socket
+                received_package = receiveData(self.socket)
                 if not received_package:
                     continue
 
@@ -203,74 +203,15 @@ class Client:
                 parsed_message = parseMessage(received_package)
                 log_event("Network", "Message received from server.")
 
-                msg_type = parsed_message.get("type", "data")
+                # Process the message
+                self.process_server_message(parsed_message)
 
-                if msg_type == "acknowledge":
-                    log_event("Network", "Acknowledgment received from server.")
-                    continue
-
-                elif msg_type == "keyRenewalRequest":
-                    # {{ edit_1 }} Handle key renewal request
-                    log_event("Key Renewal", "Received key renewal request from server.")
-                    self.handle_key_renewal_request()
-                    continue
-
-                elif msg_type == "keyRenewalResponse":
-                    # {{ edit_2 }} Handle key renewal response
-                    log_event("Key Renewal", "Received key renewal response from server.")
-                    self.handle_key_renewal_response()
-                    continue
-
-                elif msg_type == "sessionTermination":
-                    # {{ edit_3 }} Handle session termination request
-                    log_event("Session Termination", "Received session termination request from server.")
-                    self.terminate_session()
-                    break
-
-                elif msg_type == "data":
-                    # Validate nonce and timestamp
-                    nonce = bytes.fromhex(parsed_message['nonce'])
-                    timestamp = parsed_message['timestamp']
-                    if not self.nonce_manager.validate_nonce(nonce.decode('utf-8')):
-                        log_event("Security", "Invalid nonce detected!")
-                        continue
-                    if not self.nonce_manager.validate_timestamp(timestamp):
-                        log_event("Security", "Invalid timestamp detected!")
-                        continue
-
-                    # Verify the message signature before decryption
-                    signature_hex = parsed_message.get("signature", "")
-                    if not signature_hex:
-                        log_event("Security", "No signature found in the message.")
-                        continue
-                    
-                    signature = bytes.fromhex(signature_hex)
-                    message_copy = packageMessage(
-                        encryptedMessage=parsed_message['encryptedMessage'],
-                        nonce=parsed_message['nonce'],
-                        tag=parsed_message['tag'],
-                        timestamp=parsed_message['timestamp'],
-                        type=parsed_message['type'],
-                        iv=parsed_message['iv']
-                    )
-                    signature_valid = self.key_manager.verify_signature(
-                        self.server_public_key,
-                        message_copy.encode('utf-8'),
-                        signature
-                    )
-                    if not signature_valid:
-                        log_event("Security", "Invalid message signature detected!")
-                        throw_error(ErrorCode.AUTHENTICATION_ERROR, "Message signature verification failed")
-                        return
-
-                    # Decrypt the message
-                    secure_msg = SecureMessage.from_dict(parsed_message)
-                    decrypted_message = Crypto.decrypt(secure_msg, self.session_key)
-
-                    log_event("Message", f"Decrypted message: {decrypted_message.decode('utf-8')}")
-                
+            except socket.timeout:
+                continue
             except Exception as e:
-                log_event("Error", f"Failed to receive or decrypt message: {e}")
+                log_event("Error", f"Failed to receive or process message: {e}")
+                if isinstance(e, ConnectionError):
+                    break
 
     def handle_key_renewal_request(self):
         """
@@ -478,3 +419,120 @@ class Client:
             
             if hostname != common_name:
                 raise ValueError(f"Hostname {hostname} doesn't match certificate CN")
+
+    def process_server_message(self, message_data: dict):
+        """
+        Process messages received from the server.
+        
+        Args:
+            message_data (dict): The parsed message data from the server
+        """
+        try:
+            if not self.is_connected():
+                log_error(ErrorCode.STATE_ERROR, "Not connected to server")
+                return
+            
+            if not self.session_key:
+                log_error(ErrorCode.STATE_ERROR, "No active session")
+                return
+            
+            if len(str(message_data)) > MAX_MESSAGE_SIZE:
+                log_error(ErrorCode.VALIDATION_ERROR, "Message exceeds maximum size")
+                return
+            
+            sequence = message_data.get('sequence')
+            if not self.sequence_manager.validate_sequence(sequence, message_data.get('sender_id')):
+                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message sequence")
+                return
+            
+            message_type = message_data.get('type')
+            
+            if message_type == MessageType.ACKNOWLEDGE.value:
+                log_event("Message", "Server acknowledged message receipt")
+                # Message was received successfully, now we can expect a response
+                
+            elif message_type == MessageType.SERVER_RESPONSE.value:
+                # Verify signature before processing
+                signature = message_data.get('signature')
+                if not self.key_manager.verify_signature(
+                    self.server_public_key,
+                    message_data['encryptedMessage'].encode(),
+                    bytes.fromhex(signature)
+                ):
+                    log_error(ErrorCode.SECURITY_ERROR, "Invalid message signature")
+                    return
+                
+                try:
+                    # Decrypt and process server's response
+                    encrypted_msg = bytes.fromhex(message_data.get('encryptedMessage', ''))
+                    iv = bytes.fromhex(message_data.get('iv', ''))
+                    tag = bytes.fromhex(message_data.get('tag', ''))
+                    
+                    # Create SecureMessage object
+                    secure_msg = SecureMessage(
+                        encrypted_message=encrypted_msg,
+                        iv=iv,
+                        tag=tag
+                    )
+                    
+                    # Decrypt the message
+                    decrypted_message = Crypto.decrypt(secure_msg, self.session_key)
+                    log_event("Message", f"Received server response: {decrypted_message}")
+                    
+                    # Handle the server's response (e.g., trigger callbacks, update UI, etc.)
+                    self._handle_server_response(decrypted_message)
+                    
+                except Exception as e:
+                    log_error(ErrorCode.ENCRYPTION_ERROR, f"Failed to process server response: {e}")
+            
+            elif message_type == MessageType.ERROR.value:
+                error_message = message_data.get('encryptedMessage', 'Unknown error')
+                log_error(ErrorCode.SERVER_ERROR, f"Server error: {error_message}")
+                # Handle error condition appropriately
+                
+            elif message_type == MessageType.KEY_RENEWAL_RESPONSE.value:
+                # Handle key renewal response
+                try:
+                    new_server_public_key = message_data.get('encryptedMessage')
+                    if not new_server_public_key:
+                        raise ValueError("Missing server public key in renewal response")
+                        
+                    # Update server's public key
+                    self.server_public_key = serialization.load_pem_public_key(
+                        new_server_public_key.encode(),
+                        backend=default_backend()
+                    )
+                    
+                    # Derive new session key
+                    context = b"session key derivation"
+                    self.session_key = Crypto.derive_session_key(
+                        self.server_public_key,
+                        self.private_key,
+                        context
+                    )
+                    
+                    log_event("Key Management", "Key renewal completed successfully")
+                    
+                except Exception as e:
+                    log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to process key renewal response: {e}")
+                    self.terminate_session()
+                    
+            elif message_type == MessageType.SESSION_TERMINATION.value:
+                log_event("Connection", "Received session termination from server")
+                self.terminate_session()
+                
+            else:
+                log_error(ErrorCode.VALIDATION_ERROR, f"Unknown message type from server: {message_type}")
+                
+        except Exception as e:
+            log_error(ErrorCode.GENERAL_ERROR, f"Error processing server message: {e}")
+
+    def _handle_server_response(self, message: str):
+        """Handle the decrypted response from the server."""
+        try:
+            with self._lock:  # Add lock for thread safety
+                if hasattr(self, 'message_handler') and self.message_handler:
+                    self.message_handler(message)
+            
+        except Exception as e:
+            log_error(ErrorCode.GENERAL_ERROR, f"Error handling server response: {e}")

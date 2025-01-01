@@ -338,3 +338,157 @@ class Server:
             with self._clients_lock:
                 if client_id in self.clients:
                     self.close_client_connection(client_id)
+
+    def process_client_message(self, data: str, client_id: str):
+        """Process incoming client messages and handle different message types."""
+        try:
+            message = parseMessage(data)
+            timestamp = message.get('timestamp', 0)
+            current_time = int(time.time())
+            
+            # Reject messages older than 5 minutes or future messages
+            if abs(current_time - timestamp) > 300:
+                log_error(ErrorCode.VALIDATION_ERROR, "Message timestamp outside acceptable range")
+                return
+            
+            # Parse and validate the message
+            message = parseMessage(data)
+            message_type = message.get('type')
+            
+            # Get client connection
+            with self._clients_lock:
+                if client_id not in self.clients:
+                    log_error(ErrorCode.VALIDATION_ERROR, f"Unknown client ID: {client_id}")
+                    return
+                client_data = self.clients[client_id]
+                conn = client_data['connection']
+
+            # Handle different message types
+            if message_type == MessageType.DATA.value:
+                try:
+                    # Decrypt message using session key
+                    secure_msg = SecureMessage.from_dict(message)
+                    decrypted_message = Crypto.decrypt(secure_msg, client_data.get('session_key'))
+                    
+                    log_event("Message", f"Received message from client {client_id}")
+                    
+                    # Send acknowledgment
+                    ack_message = packageMessage(
+                        encryptedMessage='',
+                        signature='',
+                        nonce=self.nonce_manager.generate_nonce(),
+                        timestamp=int(time.time()),
+                        type=MessageType.ACKNOWLEDGE.value
+                    )
+                    sendData(conn, ack_message)
+                    
+                    # After acknowledgment, send a response message
+                    self.send_response_message(client_id, f"Server received: {decrypted_message}")
+                    
+                except Exception as e:
+                    log_error(ErrorCode.ENCRYPTION_ERROR, f"Failed to process encrypted message: {e}")
+                    self._send_error_response(conn, "Failed to process message")
+            elif message_type == MessageType.KEY_RENEWAL_REQUEST.value:
+                try:
+                    # Handle key renewal request
+                    new_public_key = message.get('newPublicKey')
+                    if not new_public_key:
+                        raise ValueError("Missing new public key in renewal request")
+                    
+                    # Generate new server key pair
+                    server_public_pem, server_private_pem = Crypto.generate_key_pair()
+                    
+                    # Update client's session data
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            client_data['public_key'] = serialization.load_pem_public_key(
+                                new_public_key.encode(),
+                                backend=default_backend()
+                            )
+                            
+                    # Send response with server's new public key
+                    response = packageMessage(
+                        encryptedMessage=server_public_pem.decode(),
+                        signature='',
+                        nonce=self.nonce_manager.generate_nonce(),
+                        timestamp=int(time.time()),
+                        type=MessageType.KEY_RENEWAL_RESPONSE.value
+                    )
+                    sendData(conn, response)
+                    
+                    # Update server's private key for this client
+                    self.key_manager.update_client_key(client_id, server_private_pem)
+                    
+                except Exception as e:
+                    log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key renewal failed: {e}")
+                    self._send_error_response(conn, "Key renewal failed")
+                    
+            elif message_type == MessageType.SESSION_TERMINATION.value:
+                log_event("Connection", f"Received termination request from client {client_id}")
+                self.close_client_connection(client_id)
+                
+            else:
+                log_error(ErrorCode.VALIDATION_ERROR, f"Unknown message type: {message_type}")
+                self._send_error_response(conn, "Unknown message type")
+                
+        except Exception as e:
+            log_error(ErrorCode.GENERAL_ERROR, f"Error processing client message: {e}")
+            try:
+                with self._clients_lock:
+                    if client_id in self.clients:
+                        self._send_error_response(self.clients[client_id]['connection'], str(e))
+            except Exception:
+                pass
+
+    def _send_error_response(self, conn: socket.socket, error_message: str):
+        """Send error response to client."""
+        try:
+            error_response = packageMessage(
+                encryptedMessage=error_message,
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=int(time.time()),
+                type=MessageType.ERROR.value
+            )
+            sendData(conn, error_response)
+        except Exception as e:
+            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send error response: {e}")
+
+    def send_response_message(self, client_id: str, message: str):
+        """Send an encrypted response message to a client."""
+        try:
+            with self._clients_lock:
+                if client_id not in self.clients:
+                    log_error(ErrorCode.VALIDATION_ERROR, f"Unknown client ID: {client_id}")
+                    return
+                client_data = self.clients[client_id]
+                conn = client_data['connection']
+                session_key = client_data.get('session_key')
+
+            if not session_key or len(session_key) != CryptoConstants.AES_KEY_SIZE:
+                log_error(ErrorCode.ENCRYPTION_ERROR, "Invalid or missing session key")
+                return
+
+            # Encrypt the response message
+            iv, ciphertext, tag = Crypto.aes_encrypt(message.encode('utf-8'), session_key)
+            
+            # Package and send the response
+            response = packageMessage(
+                encryptedMessage=ciphertext.hex(),
+                signature='',  # Add signature if needed
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=int(time.time()),
+                type=MessageType.SERVER_RESPONSE.value,
+                iv=iv.hex(),
+                tag=tag.hex()
+            )
+            
+            sendData(conn, response)
+            log_event("Message", f"Sent response to client {client_id}")
+            
+        except ConnectionError as e:
+            log_error(ErrorCode.NETWORK_ERROR, f"Connection lost while sending response: {e}")
+            self.close_client_connection(client_id)
+        except Exception as e:
+            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send response message: {e}")
+            self._send_error_response(conn, "Internal server error")
