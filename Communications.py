@@ -94,13 +94,16 @@ def get_next_sequence_number() -> int:
     return _sequence_manager.get_next_sequence_number()
 
 class MessageType(Enum):
-    DATA = "data"
-    KEY_RENEWAL_REQUEST = "keyRenewalRequest"
-    KEY_RENEWAL_RESPONSE = "keyRenewalResponse"
-    SESSION_TERMINATION = "sessionTermination"
-    ACKNOWLEDGE = "acknowledge"
-    ERROR = "error"
-    SERVER_RESPONSE = "serverResponse"
+    DATA = "DATA"
+    ACKNOWLEDGE = "ACKNOWLEDGE" 
+    SERVER_RESPONSE = "SERVER_RESPONSE"
+    ERROR = "ERROR"
+    KEY_RENEWAL_REQUEST = "KEY_RENEWAL_REQUEST"
+    KEY_RENEWAL_RESPONSE = "KEY_RENEWAL_RESPONSE"
+    SESSION_TERMINATION = "SESSION_TERMINATION"
+    HEARTBEAT = "HEARTBEAT"
+    STATE_VERIFICATION = "STATE_VERIFICATION"
+    STATE_RESPONSE = "STATE_RESPONSE"
 
 def packageMessage(encryptedMessage, signature, nonce, timestamp, type="data", iv="", tag="", sender_id="system", format="json", compression=None, protocol_version="2.0"):
     """Package message with sequence number for replay protection."""
