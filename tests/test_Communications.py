@@ -1,138 +1,227 @@
-import unittest
-from unittest.mock import patch, MagicMock
-
+import pytest
 import json
 import socket
-import sys
+import time
+import threading
+from unittest.mock import Mock, patch
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from Communications import (
+    SequenceNumberManager, MessageType, packageMessage, 
+    validate_message_data, parseMessage, sendData, receiveData,
+    MAX_MESSAGE_SIZE
+)
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))    
-import Communications
-class TestCommunications(unittest.TestCase):
-    """Unit tests for Communications.py functions."""
+@pytest.fixture
+def sequence_manager():
+    """Fixture to create a fresh SequenceNumberManager for each test."""
+    return SequenceNumberManager(test_mode=True)  # Enable test mode
 
-    def test_packageMessage(self):
-        """Test packaging of a message into JSON format."""
-        encryptedMessage = "encrypted"
-        signature = "signature"
-        nonce = "nonce"
-        timestamp = 1234567890
-        expected = json.dumps({
-            "encryptedMessage": encryptedMessage,
-            "signature": signature,
-            "nonce": nonce,
-            "timestamp": timestamp
-        })
-        result = Communications.packageMessage(encryptedMessage, signature, nonce, timestamp)
-        self.assertEqual(result, expected)
+@pytest.fixture
+def valid_message_data(sequence_manager):
+    """Fixture providing valid message data for tests."""
+    return {
+        "sequence": sequence_manager.get_next_sequence_number(),
+        "encryptedMessage": "encrypted_content",
+        "signature": "a" * 128,  # 64-byte hex signature
+        "nonce": "a" * 24,      # 12-byte hex nonce (24 characters)
+        "timestamp": int(time.time()),
+        "type": "data",
+        "sender_id": "test_sender"
+    }
 
-    def test_parseMessage_valid(self):
-        """Test parsing a valid JSON message."""
-        package = json.dumps({
-            "key": "value",
-            "number": 123
-        })
-        expected = {
-            "key": "value",
-            "number": 123
-        }
-        result = Communications.parseMessage(package)
-        self.assertEqual(result, expected)
+class TestSequenceNumberManager:
+    def test_sequence_number_increment(self, sequence_manager):
+        """Test sequence number generation and wraparound."""
+        initial = sequence_manager.get_next_sequence_number()
+        next_num = sequence_manager.get_next_sequence_number()
+        assert next_num == initial + 1
+        
+        # Test wraparound
+        sequence_manager._sequence = 2**32 - 1
+        next_num = sequence_manager.get_next_sequence_number()
+        assert next_num == 0
 
-    def test_parseMessage_invalid_json(self):
-        """Test parsing an invalid JSON string."""
-        package = "invalid json"
-        with self.assertRaises(json.JSONDecodeError):
-            Communications.parseMessage(package)
+    def test_sequence_number_thread_safety(self, sequence_manager):
+        """Test thread safety of sequence number generation."""
+        sequence_numbers = set()
+        num_threads = 100
+        
+        def get_sequence():
+            num = sequence_manager.get_next_sequence_number()
+            sequence_numbers.add(num)
+        
+        threads = [threading.Thread(target=get_sequence) for _ in range(num_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+            
+        assert len(sequence_numbers) == num_threads
 
-    @patch('socket.socket')
-    def test_sendData(self, mock_socket):
-        """Test sending data over a socket."""
-        destination = ('localhost', 8080)
-        data = 'test data'
-        mock_sock_instance = MagicMock()
-        mock_socket.return_value.__enter__.return_value = mock_sock_instance
+    def test_sequence_validation(self):
+        """Test sequence number validation and replay protection."""
+        # Use production mode (test_mode=False) for this test
+        sequence_manager = SequenceNumberManager(test_mode=False)
+        
+        # Test valid sequence
+        assert sequence_manager.validate_sequence(1, "sender1") is True
+        
+        # Test replay attack
+        assert sequence_manager.validate_sequence(1, "sender1") is False
+        
+        # Test sequence window
+        assert sequence_manager.validate_sequence(500, "sender1") is True
+        assert sequence_manager.validate_sequence(1, "sender1") is False  # Too old
+        
+        # Test different senders
+        assert sequence_manager.validate_sequence(1, "sender2") is True  # Different sender should work
+        assert sequence_manager.validate_sequence(1, "sender2") is False  # Replay for sender2
 
-        Communications.sendData(destination, data)
+    def test_sequence_test_mode(self):
+        """Test sequence number validation in test mode."""
+        sequence_manager = SequenceNumberManager(test_mode=True)
+        
+        # In test mode, replay should be allowed
+        assert sequence_manager.validate_sequence(1, "sender1") is True
+        assert sequence_manager.validate_sequence(1, "sender1") is True
+        
+        # Window size checks should still apply
+        assert sequence_manager.validate_sequence(500, "sender1") is True
+        assert sequence_manager.validate_sequence(1, "sender1") is True  # Should work in test mode
 
-        mock_socket.assert_called_with(socket.AF_INET, socket.SOCK_STREAM)
-        mock_sock_instance.connect.assert_called_with(destination)
-        mock_sock_instance.sendall.assert_called_with(data.encode('utf-8'))
+class TestMessageHandling:
+    def test_message_packaging(self):
+        """Test message packaging functionality."""
+        message = packageMessage(
+            encryptedMessage="test",
+            signature="sig",
+            nonce="nonce",
+            timestamp=int(time.time()),
+            type="data"
+        )
+        parsed = json.loads(message)
+        
+        assert "sequence" in parsed
+        assert parsed["encryptedMessage"] == "test"
+        assert parsed["type"] == "data"
 
-    @patch('socket.socket')
-    def test_receiveData(self, mock_socket):
-        """Test receiving data over a socket."""
-        mock_sock_instance = MagicMock()
-        mock_socket.return_value.__enter__.return_value = mock_sock_instance
+    def test_message_validation(self, valid_message_data):
+        """Test message validation with various inputs."""
+        # Test valid message
+        assert validate_message_data(valid_message_data) is True
+        
+        # Test missing required field
+        invalid_data = valid_message_data.copy()
+        del invalid_data["signature"]
+        assert validate_message_data(invalid_data) is False
+        
+        # Test invalid type
+        invalid_data = valid_message_data.copy()
+        invalid_data["sequence"] = "not_an_integer"
+        assert validate_message_data(invalid_data) is False
+        
+        # Test invalid timestamp
+        invalid_data = valid_message_data.copy()
+        invalid_data["timestamp"] = int(time.time()) + 301  # Outside allowed window
+        assert validate_message_data(invalid_data) is False
 
-        # Setup the accept() method to return a connection and address
-        mock_conn = MagicMock()
-        mock_addr = ('localhost', 12345)
-        mock_sock_instance.accept.return_value = (mock_conn, mock_addr)
-        mock_conn.recv.return_value = b'test data'
-
-        with patch('builtins.print') as mock_print:
-            result = Communications.receiveData()
-
-        mock_socket.assert_called_with(socket.AF_INET, socket.SOCK_STREAM)
-        mock_sock_instance.bind.assert_called_with(("0.0.0.0", 8080))
-        mock_sock_instance.listen.assert_called()
-        mock_sock_instance.accept.assert_called()
-        mock_conn.recv.assert_called_with(1024)
-        mock_print.assert_called_with(f"Connection established with {mock_addr}")
-        self.assertEqual(result, 'test data')
-
-    @patch('Communications.sendData')
-    @patch('json.dumps')
-    def test_sendKeyRenewalRequest(self, mock_json_dumps, mock_sendData):
-        """Test sending a key renewal request."""
-        peer = ('localhost', 8080)
-        newPublicKey = 'new_public_key'
-        timestamp = 1234567890
-        with patch('time.time', return_value=timestamp):
-            mocked_json = '{"type": "keyRenewalRequest", "newPublicKey": "new_public_key", "timestamp": 1234567890}'
-            mock_json_dumps.return_value = mocked_json
-
-            Communications.sendKeyRenewalRequest(peer, newPublicKey)
-
-            mock_json_dumps.assert_called_with({
-                "type": "keyRenewalRequest",
-                "newPublicKey": newPublicKey,
-                "timestamp": timestamp
+    def test_message_parsing(self, valid_message_data, sequence_manager):
+        """Test message parsing functionality."""
+        # Test valid message
+        message = json.dumps(valid_message_data)
+        parsed = parseMessage(message, sequence_manager=sequence_manager)
+        assert parsed["encryptedMessage"] == "encrypted_content"
+        
+        # Test oversized message
+        with pytest.raises(ValueError):
+            oversized_message = json.dumps({
+                **valid_message_data,
+                "encryptedMessage": "x" * (MAX_MESSAGE_SIZE + 1)
             })
-            mock_sendData.assert_called_with(peer, mocked_json)
+            parseMessage(oversized_message, sequence_manager=sequence_manager)
+        
+        # Test invalid JSON
+        with pytest.raises(ValueError):
+            parseMessage("{invalid json", sequence_manager=sequence_manager)
 
-    def test_handleKeyRenewalResponse_valid(self):
-        """Test handling a valid key renewal response."""
-        message = json.dumps({
-            "type": "keyRenewalResponse",
-            "status": "success",
-            "timestamp": 1234567890
-        })
-        result = Communications.handleKeyRenewalResponse(message)
-        expected = {
-            "type": "keyRenewalResponse",
-            "status": "success",
-            "timestamp": 1234567890
+class TestSocketCommunication:
+    @pytest.mark.parametrize("test_data,expected_error", [
+        ("test data", None),
+        ("x" * (MAX_MESSAGE_SIZE + 1), ValueError),
+        ("network_error", socket.error),
+    ])
+    def test_send_data(self, test_data, expected_error):
+        """Test sending data over socket with different scenarios."""
+        mock_conn = Mock()
+        
+        if expected_error == socket.error:
+            mock_conn.sendall.side_effect = socket.error("Network error")
+            
+        if expected_error:
+            with pytest.raises(expected_error):
+                sendData(mock_conn, test_data)
+        else:
+            sendData(mock_conn, test_data)
+            mock_conn.sendall.assert_called_once()
+
+    @pytest.mark.parametrize("mock_data,expected_result,expected_error", [
+        ([b"test ", b"data", b""], "test data", None),
+        ([socket.timeout()], None, TimeoutError),
+        ([b""], None, ConnectionError),
+    ])
+    def test_receive_data(self, mock_data, expected_result, expected_error):
+        """Test receiving data from socket with different scenarios."""
+        mock_conn = Mock()
+        
+        # Handle both exceptions and return values in side_effect
+        if isinstance(mock_data[0], Exception):
+            mock_conn.recv.side_effect = mock_data[0]
+        else:
+            mock_conn.recv.side_effect = mock_data
+        
+        if expected_error:
+            with pytest.raises(expected_error):
+                receiveData(mock_conn, timeout=0.1)
+        else:
+            result = receiveData(mock_conn)
+            assert result == expected_result
+
+    @pytest.mark.parametrize("msg_type,expected_valid", [
+        ("data", True),
+        ("keyRenewalRequest", True),
+        ("keyRenewalResponse", True),
+        ("sessionTermination", True),
+        ("acknowledge", True),
+        ("error", True),
+        ("invalid_type", False),
+    ])
+    def test_message_types(self, valid_message_data, sequence_manager, msg_type, expected_valid):
+        """Test message type validation with different types."""
+        # Create test data with a fresh sequence number
+        test_data = {
+            **valid_message_data,
+            "sequence": sequence_manager.get_next_sequence_number(),
+            "type": msg_type
         }
-        self.assertEqual(result, expected)
+        
+        # Pass the sequence_manager to validate_message_data
+        result = validate_message_data(test_data, sequence_manager=sequence_manager)
+        assert result is expected_valid, (
+            f"Expected validation to be {expected_valid} for message type '{msg_type}'. "
+            f"Valid types are: {[m.value for m in MessageType]}"
+        )
 
-    def test_handleKeyRenewalResponse_invalid_type(self):
-        """Test handling a response with an invalid message type."""
-        message = json.dumps({
-            "type": "wrongType",
-            "status": "success",
-            "timestamp": 1234567890
-        })
-        with self.assertRaises(ValueError) as context:
-            Communications.handleKeyRenewalResponse(message)
-        self.assertEqual(str(context.exception), "Invalid message type for key renewal response.")
+@pytest.fixture
+def mock_socket():
+    """Fixture for mocked socket connection."""
+    with patch('socket.socket') as mock:
+        yield mock
 
-    def test_handleKeyRenewalResponse_invalid_json(self):
-        """Test handling an invalid JSON response."""
-        message = "invalid json"
-        with self.assertRaises(json.JSONDecodeError):
-            Communications.handleKeyRenewalResponse(message)
-
-if __name__ == '__main__':
-    unittest.main() 
+# Optional: Configure pytest markers
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )

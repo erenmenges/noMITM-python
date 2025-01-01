@@ -168,17 +168,53 @@ class Server:
                 self.close_client_connection(client_id)
 
     def close_client_connection(self, client_id):
-        """Safely close a client connection."""
-        with self._clients_lock:  # Add thread safety
+        """Safely close a client connection with proper cleanup."""
+        with self._clients_lock:
             if client_id in self.clients:
                 try:
-                    conn = self.clients[client_id]['connection']
-                    conn.shutdown(socket.SHUT_RDWR)
-                    conn.close()
-                except Exception as e:
-                    log_error(ErrorCode.NETWORK_ERROR, f"Error closing client connection: {e}")
-                finally:
+                    client_data = self.clients[client_id]
+                    conn = client_data['connection']
+                    
+                    # Send termination message if possible
+                    try:
+                        termination_message = packageMessage(
+                            encryptedMessage='',
+                            signature='',
+                            nonce=self.nonce_manager.generate_nonce(),
+                            timestamp=int(time.time()),
+                            type=MessageType.SESSION_TERMINATION
+                        )
+                        sendData(conn, termination_message)
+                    except Exception as e:
+                        log_error(ErrorCode.NETWORK_ERROR, f"Failed to send termination message: {e}")
+                    
+                    # Proper socket shutdown sequence
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except socket.error:
+                        pass  # Socket might already be closed
+                    finally:
+                        try:
+                            conn.close()
+                        except socket.error:
+                            pass
+
+                    # Clean up cryptographic material
+                    if 'session_key' in client_data:
+                        key_data = client_data['session_key']
+                        if isinstance(key_data, bytes):
+                            client_data['session_key'] = b'\x00' * len(key_data)
+                        self.key_manager.remove_session_key(client_id)
+                    
                     del self.clients[client_id]
+                    log_event("Connection", f"Client {client_id} disconnected and cleaned up")
+                    
+                except Exception as e:
+                    log_error(ErrorCode.NETWORK_ERROR, f"Error during client cleanup: {e}")
+                finally:
+                    # Ensure client is removed even if cleanup fails
+                    if client_id in self.clients:
+                        del self.clients[client_id]
 
     def shutdown(self):
         """Shutdown the server and cleanup all resources."""
@@ -230,21 +266,42 @@ class Server:
 
     def handle_client(self, conn, addr, client_id):
         """Handle client connection with proper resource management."""
+        client_data = None
         try:
             conn.settimeout(self.connection_timeout)
             
-            # Initialize client session
+            # Initialize client session atomically
             with self._clients_lock:
                 if client_id in self.clients:
-                    # Duplicate connection, close old one
-                    self.close_client_connection(client_id)
-                
-                self.clients[client_id] = {
-                    'connection': conn,
-                    'address': addr,
-                    'last_activity': time.time(),
-                    'session_established': False
-                }
+                    # Store old connection data for cleanup
+                    old_client = self.clients[client_id]
+                    # Update with new connection
+                    client_data = {
+                        'connection': conn,
+                        'address': addr,
+                        'last_activity': time.time(),
+                        'session_established': False,
+                        'recv_buffer': bytearray(),
+                        'send_buffer': bytearray()
+                    }
+                    self.clients[client_id] = client_data
+                    
+                    # Clean up old connection outside the lock
+                    try:
+                        old_client['connection'].shutdown(socket.SHUT_RDWR)
+                        old_client['connection'].close()
+                    except Exception:
+                        pass
+                else:
+                    client_data = {
+                        'connection': conn,
+                        'address': addr,
+                        'last_activity': time.time(),
+                        'session_established': False,
+                        'recv_buffer': bytearray(),
+                        'send_buffer': bytearray()
+                    }
+                    self.clients[client_id] = client_data
             
             while self.running:
                 try:
@@ -263,6 +320,13 @@ class Server:
                     self.process_client_message(data, client_id)
                     
                 except socket.timeout:
+                    # Check for client timeout
+                    with self._clients_lock:
+                        if client_id in self.clients:
+                            last_activity = self.clients[client_id]['last_activity']
+                            if time.time() - last_activity > self.connection_timeout:
+                                log_event("Connection", f"Client {client_id} timed out")
+                                break
                     continue
                 except ConnectionError:
                     break

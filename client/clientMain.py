@@ -3,7 +3,7 @@ import socket
 from Communications import packageMessage, parseMessage, sendData, receiveData, MessageType
 from Crypto import Crypto, SecureMessage
 from KeyManagement import KeyManagement
-from Utils import NonceManager, log_event, log_error, ErrorCode, ErrorMessage
+from Utils import NonceManager, log_event, log_error, ErrorCode, ErrorMessage, throw_error
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
@@ -50,6 +50,10 @@ class Client:
             try:
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(30)
+                
+                # Connect first, then wrap with TLS
+                self.socket.connect(destination)
+                log_event("Network", f"Connected to server at {destination}.")
 
                 # If TLS is enabled, wrap the socket and perform certificate exchange
                 if hasattr(self, 'tls_config') and self.tls_config.enabled:
@@ -75,9 +79,6 @@ class Client:
                         )
                         self._validate_server_certificate()
                         log_event("Security", "Server certificate validated.")
-
-                self.socket.connect(destination)
-                log_event("Network", f"Connected to server at {destination}.")
 
                 # Continue with existing key exchange logic
                 # Generate the client's key pair for secure communication
@@ -253,13 +254,14 @@ class Client:
                         iv=parsed_message['iv']
                     )
                     signature_valid = self.key_manager.verify_signature(
-                        self.server_public_key,  # Assume server_public_key is stored after session establishment
+                        self.server_public_key,
                         message_copy.encode('utf-8'),
                         signature
                     )
                     if not signature_valid:
                         log_event("Security", "Invalid message signature detected!")
-                        continue
+                        throw_error(ErrorCode.AUTHENTICATION_ERROR, "Message signature verification failed")
+                        return
 
                     # Decrypt the message
                     secure_msg = SecureMessage.from_dict(parsed_message)
