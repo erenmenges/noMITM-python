@@ -283,57 +283,56 @@ class Crypto:
             raise
 
     @staticmethod
-    def derive_session_key(peer_public_key: ec.EllipticCurvePublicKey,
-                          private_key: ec.EllipticCurvePrivateKey,
-                          context: bytes) -> bytes:
-        """Derive a session key using ECDH and HKDF."""
-        log_event("Crypto", "[CRYPTO] Starting session key derivation")
+    def derive_session_key(peer_public_key, private_key, context: bytes) -> bytes:
+        """
+        Derive a shared session key using ECDH and HKDF.
         
-        shared_secret = None
-        derived_key = None
-        result = None
-        
+        Args:
+            peer_public_key: The peer's public key
+            private_key: Our private key
+            context: Context info for the key derivation
+            
+        Returns:
+            bytes: The derived session key
+        """
         try:
-            log_event("Crypto", "[CRYPTO] Generating salt for HKDF")
-            salt = secrets.token_bytes(CryptoConstants.SALT_SIZE)
+            log_event("Crypto", "[CRYPTO] Starting session key derivation")
             
+            # Perform ECDH key agreement
             log_event("Crypto", "[CRYPTO] Performing ECDH key agreement")
-            shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
+            shared_key = private_key.exchange(ec.ECDH(), peer_public_key)
             
+            # Derive final key using HKDF
             log_event("Crypto", "[CRYPTO] Performing HKDF key derivation")
-            derived_key = HKDF(
+            hkdf = HKDF(
                 algorithm=hashes.SHA256(),
                 length=CryptoConstants.AES_KEY_SIZE,
-                salt=salt,
+                salt=None,  # Remove salt
                 info=context,
                 backend=default_backend()
-            ).derive(shared_secret)
+            )
+            derived_key = hkdf.derive(shared_key)
             
-            result = bytes(derived_key)
             log_event("Crypto", "[CRYPTO] Session key derived successfully")
-            return result
+            return derived_key
             
-        except ValueError as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] Session key derivation failed (ValueError): {str(e)}")
-            raise
         except Exception as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] Session key derivation failed: {str(e)}")
-            raise RuntimeError(f"Session key derivation failed: {str(e)}")
-            
-        finally:
-            log_event("Crypto", "[CRYPTO] Securely clearing sensitive key material")
-            if shared_secret is not None:
-                for i in range(len(shared_secret)):
-                    shared_secret = shared_secret[:i] + b'\x00' + shared_secret[i+1:]
-            if derived_key is not None:
-                for i in range(len(derived_key)):
-                    derived_key = derived_key[:i] + b'\x00' + derived_key[i+1:]
-            gc.collect()
-            log_event("Crypto", "[CRYPTO] Sensitive key material cleared")
+            log_error(ErrorCode.CRYPTO_ERROR, f"Session key derivation failed: {e}")
+            raise
 
     @staticmethod
-    def encrypt(data: bytes, key: bytes, associated_data: bytes = None) -> SecureMessage:
-        """Encrypt data using AES-GCM with authentication."""
+    def encrypt(data: bytes, key: bytes, associated_data: bytes = None) -> Tuple[bytes, bytes, bytes, bytes]:
+        """
+        Encrypt data using AES-GCM with authentication.
+        
+        Args:
+            data: The plaintext to encrypt
+            key: The encryption key
+            associated_data: Optional authenticated associated data
+            
+        Returns:
+            Tuple[bytes, bytes, bytes, bytes]: (ciphertext, nonce, tag, salt)
+        """
         log_event("Crypto", "[CRYPTO] Starting encryption process")
         
         if not isinstance(data, bytes) or not isinstance(key, bytes):
@@ -345,85 +344,74 @@ class Crypto:
                      f"[CRYPTO] Invalid key size: {len(key)}, expected {CryptoConstants.AES_KEY_SIZE}")
             raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
 
-        crypto = Crypto()
         try:
-            log_event("Crypto", "[CRYPTO] Creating data copies for secure handling")
-            data_copy = bytes(data)
-            key_copy = bytes(key)
-            
             log_event("Crypto", "[CRYPTO] Generating encryption parameters")
-            nonce = crypto._nonce_manager.generate_nonce()
+            nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
             salt = secrets.token_bytes(CryptoConstants.SALT_SIZE)
             
             log_event("Crypto", "[CRYPTO] Initializing AES-GCM cipher")
-            aesgcm = AESGCM(key_copy)
+            aesgcm = AESGCM(key)
             
             log_event("Crypto", "[CRYPTO] Performing encryption")
-            ciphertext_with_tag = aesgcm.encrypt(nonce, data_copy, associated_data)
+            ciphertext_with_tag = aesgcm.encrypt(nonce, data, associated_data)
             
             log_event("Crypto", "[CRYPTO] Extracting tag and ciphertext")
             tag = ciphertext_with_tag[-16:]
             ciphertext = ciphertext_with_tag[:-16]
             
-            log_event("Crypto", "[CRYPTO] Creating SecureMessage object")
-            secure_msg = SecureMessage(
-                ciphertext=ciphertext,
-                nonce=nonce,
-                tag=tag,
-                version=CryptoConstants.VERSION,
-                salt=salt
-            )
-            
-            log_event("Crypto", "[CRYPTO] Securely clearing sensitive data copies")
-            key_copy = b'\x00' * len(key_copy)
-            data_copy = b'\x00' * len(data_copy)
-            ciphertext_with_tag = b'\x00' * len(ciphertext_with_tag)
-            
             log_event("Crypto", "[CRYPTO] Encryption completed successfully")
-            return secure_msg
+            return ciphertext, nonce, tag, salt
             
         except Exception as e:
             log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] Encryption failed: {str(e)}")
             raise RuntimeError(f"Encryption failed: {str(e)}")
 
     @staticmethod
-    def decrypt(secure_msg: SecureMessage, key: bytes) -> bytes:
-        """Decrypt data using AES-GCM with authentication."""
-        log_event("Crypto", "[CRYPTO] Starting decryption process")
+    def decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes, 
+               associated_data: bytes = None) -> bytes:
+        """
+        Decrypt data using AES-GCM with authentication.
+        
+        Args:
+            ciphertext: The encrypted data
+            key: The decryption key
+            nonce: The nonce used during encryption
+            tag: The authentication tag
+            associated_data: Optional authenticated associated data
+            
+        Returns:
+            bytes: The decrypted plaintext
+        """
+        log_event("Crypto", "[CRYPTO] Starting AES-GCM decryption")
         
         if len(key) != CryptoConstants.AES_KEY_SIZE:
             log_error(ErrorCode.CRYPTO_ERROR, 
-                     f"[CRYPTO] Invalid key size: {len(key)}, expected {CryptoConstants.AES_KEY_SIZE}")
+                     f"[CRYPTO] Invalid key size for AES decryption: {len(key)} != {CryptoConstants.AES_KEY_SIZE}")
             raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
-
-        if secure_msg.version != CryptoConstants.VERSION:
+        
+        if len(nonce) != CryptoConstants.NONCE_SIZE:
             log_error(ErrorCode.CRYPTO_ERROR, 
-                     f"[CRYPTO] Protocol version mismatch: {secure_msg.version} != {CryptoConstants.VERSION}")
-            raise ValueError("Unsupported protocol version")
-
+                     f"[CRYPTO] Invalid nonce size for AES decryption: {len(nonce)} != {CryptoConstants.NONCE_SIZE}")
+            raise ValueError(f"Nonce must be {CryptoConstants.NONCE_SIZE} bytes long")
+        
         try:
             log_event("Crypto", "[CRYPTO] Initializing AES-GCM cipher for decryption")
             aesgcm = AESGCM(key)
-
-            log_event("Crypto", "[CRYPTO] Combining ciphertext and tag")
-            ciphertext_with_tag = secure_msg.ciphertext + secure_msg.tag
-
-            log_event("Crypto", "[CRYPTO] Attempting decryption and authentication")
-            plaintext = aesgcm.decrypt(
-                secure_msg.nonce,
-                ciphertext_with_tag,
-                None
-            )
-
-            log_event("Crypto", "[CRYPTO] Decryption completed successfully")
-            return plaintext
             
+            log_event("Crypto", "[CRYPTO] Combining ciphertext and tag for authenticated decryption")
+            ciphertext_with_tag = ciphertext + tag
+            
+            log_event("Crypto", "[CRYPTO] Attempting AES decryption with authentication")
+            plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, associated_data)
+            
+            log_event("Crypto", "[CRYPTO] AES decryption completed successfully")
+            return plaintext
         except InvalidTag as e:
-            log_error(ErrorCode.CRYPTO_ERROR, "[CRYPTO] Authentication failed during decryption")
-            raise RuntimeError("Decryption failed: Authentication failed")
+            log_error(ErrorCode.CRYPTO_ERROR, "[CRYPTO] AES decryption authentication failed")
+            raise InvalidTag("Message authentication failed - possible tampering detected")
         except Exception as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] Decryption failed: {str(e)}")
-            raise RuntimeError(f"Decryption failed: {str(e)}")
+            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] AES decryption failed: {e}")
+            raise RuntimeError(f"Decryption failed: {e}")
 
     @staticmethod
     def hash(data: bytes) -> bytes:
@@ -492,70 +480,6 @@ class Crypto:
         except Exception as e:
             log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] MAC verification failed: {e}")
             return False
-
-    @staticmethod
-    def aes_encrypt(data: bytes, key: bytes) -> Tuple[bytes, bytes, bytes]:
-        """Encrypt data using AES-GCM and return (nonce, ciphertext, tag)."""
-        log_event("Crypto", "[CRYPTO] Starting AES-GCM encryption")
-        
-        if len(key) != CryptoConstants.AES_KEY_SIZE:
-            log_error(ErrorCode.CRYPTO_ERROR, 
-                     f"[CRYPTO] Invalid key size for AES encryption: {len(key)} != {CryptoConstants.AES_KEY_SIZE}")
-            raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
-        
-        try:
-            log_event("Crypto", "[CRYPTO] Generating nonce for AES encryption")
-            nonce = secrets.token_bytes(CryptoConstants.NONCE_SIZE)
-            
-            log_event("Crypto", "[CRYPTO] Initializing AES-GCM cipher")
-            aesgcm = AESGCM(key)
-            
-            log_event("Crypto", "[CRYPTO] Performing AES encryption")
-            ciphertext = aesgcm.encrypt(nonce, data, None)
-            
-            log_event("Crypto", "[CRYPTO] Extracting authentication tag")
-            tag = ciphertext[-16:]
-            ciphertext = ciphertext[:-16]
-            
-            log_event("Crypto", "[CRYPTO] AES encryption completed successfully")
-            return nonce, ciphertext, tag
-        except Exception as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] AES encryption failed: {e}")
-            raise RuntimeError(f"AES encryption failed: {e}")
-
-    @staticmethod
-    def aes_decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes) -> bytes:
-        """Decrypt data using AES-GCM with explicit tag validation."""
-        log_event("Crypto", "[CRYPTO] Starting AES-GCM decryption")
-        
-        if len(key) != CryptoConstants.AES_KEY_SIZE:
-            log_error(ErrorCode.CRYPTO_ERROR, 
-                     f"[CRYPTO] Invalid key size for AES decryption: {len(key)} != {CryptoConstants.AES_KEY_SIZE}")
-            raise ValueError(f"Key must be {CryptoConstants.AES_KEY_SIZE} bytes long")
-        
-        if len(nonce) != CryptoConstants.NONCE_SIZE:
-            log_error(ErrorCode.CRYPTO_ERROR, 
-                     f"[CRYPTO] Invalid nonce size for AES decryption: {len(nonce)} != {CryptoConstants.NONCE_SIZE}")
-            raise ValueError(f"Nonce must be {CryptoConstants.NONCE_SIZE} bytes long")
-        
-        try:
-            log_event("Crypto", "[CRYPTO] Initializing AES-GCM cipher for decryption")
-            aesgcm = AESGCM(key)
-            
-            log_event("Crypto", "[CRYPTO] Combining ciphertext and tag for authenticated decryption")
-            ciphertext_with_tag = ciphertext + tag
-            
-            log_event("Crypto", "[CRYPTO] Attempting AES decryption with authentication")
-            plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
-            
-            log_event("Crypto", "[CRYPTO] AES decryption completed successfully")
-            return plaintext
-        except InvalidTag as e:
-            log_error(ErrorCode.CRYPTO_ERROR, "[CRYPTO] AES decryption authentication failed")
-            raise InvalidTag("Message authentication failed - possible tampering detected")
-        except Exception as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] AES decryption failed: {e}")
-            raise RuntimeError(f"Decryption failed: {e}")
 
     @staticmethod
     def sign(data: bytes, private_key: bytes) -> bytes:

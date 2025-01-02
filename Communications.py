@@ -366,6 +366,7 @@ def parseMessage(package, sequence_manager=None):
             raise ValueError("Invalid message format")
             
         log_event("Communications", "[COMMUNICATIONS] Message parsed and validated successfully")
+        log_event("Communications", f"[COMMUNICATIONS] Message content: {data}")
         return data
         
     except json.JSONDecodeError as e:

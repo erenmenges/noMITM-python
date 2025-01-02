@@ -159,6 +159,11 @@ class Client:
             'buffers': []
         }
         self._resource_lock = threading.Lock()
+        
+        # Generate keys if needed
+        if not self.key_manager.has_key_pair():
+            self.key_manager.generate_key_pair()
+
     def register_error_handler(self, handler):
         """Register callback for error notifications."""
         with self._handler_lock:
@@ -347,23 +352,16 @@ class Client:
             self._update_state(state_update)
             log_event("Session", "[SECURE_SESSION] Connection state updated successfully")
             
-            # Generate key pair for key exchange
+            # Generate key pair using KeyManagement
             try:
                 log_event("Security", "[SECURE_SESSION] Starting key pair generation")
-                log_event("Security", "[SECURE_SESSION] Calling Crypto.generate_key_pair()")
-                public_pem, private_pem = Crypto.generate_key_pair()
-                log_event("Security", "[SECURE_SESSION] Key pair generated successfully")
-                log_event("Security", f"[SECURE_SESSION] Public key size: {len(public_pem)} bytes")
+                if not self.key_manager.has_key_pair():
+                    self.key_manager.generate_key_pair()
+                    log_event("Security", "[SECURE_SESSION] Generated new key pair")
                 
-                # Load the PEM keys into key objects
-                log_event("Security", "[SECURE_SESSION] Loading private key from PEM")
-                private_key = serialization.load_pem_private_key(
-                    private_pem,
-                    password=None,
-                    backend=default_backend()
-                )
-                log_event("Security", "[SECURE_SESSION] Private key loaded successfully")
-                log_event("Security", f"[SECURE_SESSION] Private key type: {type(private_key).__name__}")
+                # Get the public key PEM for sending to server
+                public_key_pem = self.key_manager.get_public_key_pem()
+                log_event("Security", f"[SECURE_SESSION] Public key size: {len(public_key_pem)} bytes")
                 
             except Exception as e:
                 log_error(ErrorCode.CRYPTO_ERROR, f"[SECURE_SESSION] Key generation/loading failed: {str(e)}")
@@ -384,87 +382,59 @@ class Client:
                 timestamp = int(time.time())
                 log_event("Security", f"[SECURE_SESSION] Using timestamp: {timestamp}")
                 
-                # Prepare message
+                # Prepare message with temporary client ID
+                temp_client_id = str(id(self))  # Temporary ID until we get server-assigned one
                 key_exchange_message = {
                     'type': MessageType.KEY_EXCHANGE.value,
                     'nonce': nonce,
                     'timestamp': timestamp,
-                    'client_id': str(id(self)),
-                    'public_key': public_pem.decode('utf-8')
+                    'client_id': temp_client_id,
+                    'public_key': public_key_pem.decode('utf-8')
                 }
                 log_event("Security", "[SECURE_SESSION] Key exchange message prepared")
-                log_event("Security", f"[SECURE_SESSION] Message type: {key_exchange_message['type']}")
-                log_event("Security", f"[SECURE_SESSION] Client ID: {key_exchange_message['client_id']}")
-                
-                # Convert to bytes
-                log_event("Security", "[SECURE_SESSION] Converting message to JSON")
-                message_bytes = json.dumps(key_exchange_message).encode('utf-8')
-                log_event("Security", f"[SECURE_SESSION] Message size: {len(message_bytes)} bytes")
                 
                 # Send key exchange request
-                log_event("Security", "[SECURE_SESSION] Sending key exchange request")
+                message_bytes = json.dumps(key_exchange_message).encode('utf-8')
+                log_event("Security", f"[SECURE_SESSION] Message size: {len(message_bytes)} bytes")
                 sendData(self.socket, message_bytes)
                 log_event("Security", "[SECURE_SESSION] Key exchange request sent successfully")
                 
-                # Wait for response
-                log_event("Security", f"[SECURE_SESSION] Setting socket timeout to {self._operation_timeouts['key_exchange']}s for response")
-                self.socket.settimeout(self._operation_timeouts['key_exchange'])
-                log_event("Security", "[SECURE_SESSION] Waiting for key exchange response")
-                
+                # Handle server response
                 response_data = receiveData(self.socket)
-                if not response_data:
-                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, "[SECURE_SESSION] No response received")
-                    raise SecurityError("No response received during key exchange")
-                
                 log_event("Security", f"[SECURE_SESSION] Received response: {len(response_data)} bytes")
                 
-                # Parse response
-                log_event("Security", "[SECURE_SESSION] Parsing response JSON")
                 response = json.loads(response_data.decode('utf-8'))
-                log_event("Security", f"[SECURE_SESSION] Response type: {response.get('type')}")
-                
-                # Validate response type
                 if response.get('type') != MessageType.KEY_EXCHANGE_RESPONSE.value:
-                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, 
-                             f"[SECURE_SESSION] Invalid response type: {response.get('type')}")
+                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"[SECURE_SESSION] Invalid response type: {response.get('type')}")
                     raise SecurityError("Invalid response type during key exchange")
                 
-                # Load server's public key
-                log_event("Security", "[SECURE_SESSION] Loading server's public key")
+                # Get server-assigned client ID
+                self.client_id = response.get('client_id')
+                if not self.client_id:
+                    log_error(ErrorCode.KEY_EXCHANGE_ERROR, "[SECURE_SESSION] No client ID in server response")
+                    raise SecurityError("Missing client ID in server response")
+                log_event("Security", f"[SECURE_SESSION] Using server-assigned client ID: {self.client_id}")
+                
+                # Load server's public key and derive session key
                 server_public_key = serialization.load_pem_public_key(
                     response['public_key'].encode('utf-8'),
                     backend=default_backend()
                 )
                 log_event("Security", "[SECURE_SESSION] Server public key loaded")
-
-                # Perform ECDH to derive shared secret
-                log_event("Security", "[SECURE_SESSION] Performing ECDH key exchange")
-                shared_key = private_key.exchange(
-                    ec.ECDH(),
-                    server_public_key
+                
+                private_key = self.key_manager.get_private_key()
+                session_key = Crypto.derive_session_key(
+                    peer_public_key=server_public_key,
+                    private_key=private_key,
+                    context=b'session key'
                 )
-                log_event("Security", "[SECURE_SESSION] ECDH exchange completed")
-
-                # Derive session key using HKDF
-                log_event("Security", "[SECURE_SESSION] Deriving session key using HKDF")
-                session_key = HKDF(
-                    algorithm=hashes.SHA256(),
-                    length=32,
-                    salt=None,
-                    info=b'session key',
-                    backend=default_backend()
-                ).derive(shared_key)
-                log_event("Security", f"[SECURE_SESSION] Session key derived, size: {len(session_key)} bytes")
-
-                # Store session key
-                try:
-                    log_event("Security", "[SECURE_SESSION] Storing session key")
-                    self.key_manager.set_session_key('default', session_key)
-                    self.set_session_key(session_key)
-                    log_event("Security", "[SECURE_SESSION] Session key stored successfully")
-                except Exception as e:
-                    log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"[SECURE_SESSION] Failed to store session key: {str(e)}")
-                    raise
+                log_event("Security", "[SECURE_SESSION] Session key derived successfully")
+                
+                # Store session key using server-assigned client ID
+                self.key_manager.store_session_key(self.client_id, session_key)
+                log_event("Security", "[SECURE_SESSION] Session key stored successfully")
+                # Add debug log for session key
+                log_event("Security", f"[DEBUG] Client session key (hex): {session_key.hex()}")
                 
                 # Start monitoring
                 log_event("Connection", "[SECURE_SESSION] Starting connection monitoring threads")
@@ -482,23 +452,15 @@ class Client:
                 log_event("Session", "[SECURE_SESSION] Secure session establishment completed successfully")
                 return True
                 
-            except socket.timeout:
-                log_error(ErrorCode.TIMEOUT_ERROR, "[SECURE_SESSION] Key exchange timed out")
-                log_error(ErrorCode.TIMEOUT_ERROR, f"[SECURE_SESSION] Timeout value: {self._operation_timeouts['key_exchange']}s")
-                raise SecurityError("Key exchange timed out")
-            
+            except Exception as e:
+                log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"[SECURE_SESSION] Key exchange failed: {str(e)}")
+                raise
+                
         except Exception as e:
             log_error(ErrorCode.CONNECTION_ERROR, f"[SECURE_SESSION] Failed to establish secure session: {str(e)}")
             log_error(ErrorCode.CONNECTION_ERROR, f"[SECURE_SESSION] Exception type: {type(e)}")
-            log_error(ErrorCode.CONNECTION_ERROR, "[SECURE_SESSION] Stack trace:", exc_info=True)
             self._cleanup_connection()
             return False
-        finally:
-            # Restore default timeout
-            if self.socket:
-                log_event("Session", f"[SECURE_SESSION] Restoring default socket timeout to {self._connection_timeout}s")
-                self.socket.settimeout(self._connection_timeout)
-                log_event("Session", "[SECURE_SESSION] Socket timeout restored")
 
     def _secure_clear_bytes(self, data: bytes):
         """Securely clear sensitive bytes from memory."""
@@ -558,54 +520,59 @@ class Client:
     def send_message(self, message: str) -> bool:
         """Send an encrypted message to the server."""
         try:
-            if not self.is_connected():
-                log_error(ErrorCode.CONNECTION_ERROR, "Cannot send message - not connected")
-                return False
-
-            # Get the session key from key manager
-            session_key = self.key_manager.get_session_key('default')
-            if not session_key:
-                log_error(ErrorCode.SECURITY_ERROR, "No session key available")
-                return False
-
             # Convert message to bytes
             message_bytes = message.encode('utf-8')
-
-            # Create Crypto instance and encrypt the message
-            try:
-                encrypted_message = Crypto.encrypt(
-                    data=message_bytes,
-                    key=session_key,
-                    associated_data=b'message'
-                )
-                log_event("Security", "[CLIENT] Message encrypted successfully")
-            except Exception as e:
-                log_error(ErrorCode.CRYPTO_ERROR, f"Failed to encrypt message: {str(e)}")
-                return False
-
-            # Package the encrypted message
+            
+            # Get session key with server-assigned client ID
+            session_key = self.key_manager.get_session_key(self.client_id)
+            if not session_key:
+                raise SecurityError("No session key available")
+            
+            # Get sequence number first
+            sequence = self.sequence_manager.get_next_sequence()
+            
+            # Create associated data for authentication - only include stable fields
+            # Use message fields directly to ensure exact match with server
+            aad_dict = {
+                'sender_id': self.client_id,
+                'sequence': sequence
+            }
+            associated_data = json.dumps(aad_dict, sort_keys=True).encode('utf-8')
+            
+            # Get current timestamp for message metadata
+            timestamp = int(time.time())
+            
+            # Encrypt the message with associated data
+            ciphertext, nonce, tag, salt = Crypto.encrypt(
+                data=message_bytes,
+                key=session_key,
+                associated_data=associated_data
+            )
+            
+            # Get signing key and create signature
+            signing_key = self.key_manager.get_signing_key()
+            signature = Crypto.sign(ciphertext, signing_key)
+            
+            # Package the message - use same values as AAD
             message_data = {
                 'type': MessageType.DATA.value,
-                'encryptedMessage': encrypted_message.ciphertext.hex(),
-                'nonce': encrypted_message.nonce.hex(),
-                'tag': encrypted_message.tag.hex(),
-                'version': encrypted_message.version,
-                'timestamp': int(time.time()),
-                'sender_id': str(id(self)),
-                'sequence': self.sequence_manager.get_next_sequence()
+                'encryptedMessage': ciphertext.hex(),
+                'nonce': nonce.hex(),
+                'tag': tag.hex(),
+                'version': 1,
+                'timestamp': timestamp,
+                'sender_id': aad_dict['sender_id'],  # Use exact same value as AAD
+                'sequence': aad_dict['sequence'],    # Use exact same value as AAD
+                'signature': signature.hex()
             }
-
-            # Sign the message data
-            message_data['signature'] = self._sign_message(message_data)  # Add signature
-
+            
             # Send the message
             message_bytes = json.dumps(message_data).encode('utf-8')
             sendData(self.socket, message_bytes)
-            log_event("Communication", f"Sent encrypted message of {len(message_bytes)} bytes")
             return True
-
+            
         except Exception as e:
-            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {str(e)}")
+            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {e}")
             return False
 
     def _handle_encryption_failure(self):
@@ -1622,20 +1589,45 @@ class Client:
         except Exception as e:
             log_error(ErrorCode.STATE_ERROR, f"Failed to persist state: {e}")
 
-    def _encrypt_message(self, message: bytes) -> SecureMessage:
-        """Encrypt a message using the session key."""
+    def _handle_key_exchange_response(self, response: dict) -> bool:
+        """Handle key exchange response from server."""
         try:
-            session_key = self.get_session_key()
-            if not session_key:
-                raise SecurityError("No session key available")
+            # Extract server's public key and client ID
+            server_public_key_pem = response.get('public_key')
+            self.client_id = response.get('client_id')  # Store server-assigned ID
             
-            # Remove associated_data parameter since it's not supported
-            encrypted_message = Crypto.encrypt(
-                data=message,
-                key=session_key
+            if not server_public_key_pem or not self.client_id:
+                log_error(ErrorCode.KEY_EXCHANGE_ERROR, "Missing public key or client ID in response")
+                return False
+            
+            log_event("Security", f"[SECURE_SESSION] Using server-assigned client ID: {self.client_id}")
+            
+            # Load server's public key
+            server_public_key = serialization.load_pem_public_key(
+                server_public_key_pem.encode('utf-8'),
+                backend=default_backend()
             )
-            return encrypted_message
+            
+            # Get private key and derive session key
+            log_event("Security", "[SECURE_SESSION] Getting private key and deriving session key")
+            private_key = self.key_manager.get_private_key()
+            
+            # Derive shared key
+            session_key = Crypto.derive_session_key(
+                peer_public_key=server_public_key,
+                private_key=private_key,
+                context=b'session key'
+            )
+            
+            # Store session key using server-assigned client ID
+            self.key_manager.store_session_key(self.client_id, session_key)
+            log_event("Security", "[SECURE_SESSION] Session key stored successfully")
+            # Add debug log for session key
+            log_event("Security", f"[DEBUG] Client session key (hex): {session_key.hex()}")
+            
+            return True
+            
         except Exception as e:
-            log_error(ErrorCode.CRYPTO_ERROR, f"Failed to encrypt message: {e}")
-            raise
+            log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange response handling failed: {e}")
+            return False
 

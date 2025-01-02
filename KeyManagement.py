@@ -75,12 +75,20 @@ class KeyManagement:
                 log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key cleanup error: {e}")
 
     def get_session_key(self, key_id: str) -> Optional[bytes]:
-        """Retrieve a session key."""
-        with self._key_lock:
-            key_data = self._keys.get(key_id)
-            if key_data:
-                key_data['last_used'] = time.time()
-                return key_data['key']
+        """Get a session key from secure storage.
+        
+        Args:
+            key_id: Unique identifier for the session key
+            
+        Returns:
+            bytes: The session key if found, None otherwise
+        """
+        try:
+            key_name = f'session_key_{key_id}'
+            return self._secure_storage.retrieve(key_name)
+            
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to get session key: {e}")
             return None
             
     def set_session_key(self, key_id: str, key: bytes):
@@ -469,6 +477,110 @@ class KeyManagement:
         except Exception as e:
             log_error(ErrorCode.SECURITY_ERROR, f"Failed to retrieve signing key: {str(e)}")
             raise SecurityError("Failed to get signing key") from e
+
+    def has_key_pair(self) -> bool:
+        """Check if a key pair exists in secure storage."""
+        try:
+            # Check if both private and public keys exist
+            private_key = self._secure_storage.retrieve('private_key')
+            public_key = self._secure_storage.retrieve('public_key')
+            return bool(private_key and public_key)
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Error checking key pair existence: {e}")
+            return False
+
+    def generate_key_pair(self):
+        """Generate and store a new key pair using Crypto."""
+        try:
+            # Generate the key pair - returns PEM bytes
+            public_pem, private_pem = Crypto.generate_key_pair()
+            
+            # Store PEM formatted keys directly
+            self._secure_storage.store('private_key', private_pem)
+            self._secure_storage.store('public_key', public_pem)
+            
+            log_event("Security", "[KEY_MGMT] Generated and stored new key pair")
+            
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to generate key pair: {e}")
+            raise
+
+    def get_public_key_pem(self) -> bytes:
+        """Get the public key in PEM format.
+        
+        Returns:
+            bytes: The public key in PEM format
+            
+        Raises:
+            SecurityError: If no public key is available
+        """
+        try:
+            # Get the stored public key
+            public_key_bytes = self._secure_storage.retrieve('public_key')
+            if not public_key_bytes:
+                raise SecurityError("No public key available")
+            
+            # Load it as a key object
+            public_key = serialization.load_pem_public_key(
+                public_key_bytes,
+                backend=default_backend()
+            )
+            
+            # Return it in PEM format
+            return public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to get public key PEM: {e}")
+            raise
+
+    def get_private_key(self) -> ec.EllipticCurvePrivateKey:
+        """Get the private key object.
+        
+        Returns:
+            ec.EllipticCurvePrivateKey: The private key object
+            
+        Raises:
+            SecurityError: If no private key is available
+        """
+        try:
+            # Get the stored private key PEM
+            private_key_pem = self._secure_storage.retrieve('private_key')
+            if not private_key_pem:
+                raise SecurityError("No private key available")
+            
+            # Load and return the key object
+            return serialization.load_pem_private_key(
+                private_key_pem,
+                password=None,
+                backend=default_backend()
+            )
+            
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to get private key: {e}")
+            raise
+
+    def store_session_key(self, key_id: str, session_key: bytes):
+        """Store a session key in secure storage.
+        
+        Args:
+            key_id: Unique identifier for the session key
+            session_key: The session key bytes to store
+            
+        Raises:
+            SecurityError: If storing the key fails
+        """
+        try:
+            # Store with a prefix to avoid collisions with other keys
+            key_name = f'session_key_{key_id}'
+            self._secure_storage.store(key_name, session_key)
+            log_event("Security", f"[KEY_MGMT] Stored new session key for {key_id}")
+            
+        except Exception as e:
+            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to store session key: {e}")
+            raise
 
 
 class OCSPValidator:
