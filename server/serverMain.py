@@ -84,7 +84,8 @@ class Server:
             self._initialize_certificates()
         
         self._initialized = True
-
+        self.received_first_message = {}  # Track first message status per client
+        
     def _initialize_certificates(self):
         """Initialize server certificates and validation chain."""
         try:
@@ -275,10 +276,12 @@ class Server:
                 
                 # If it's a DATA message, decrypt and print it
                 if message['type'] == MessageType.DATA.value:
-                    # Use the new _process_secure_message method
                     decrypted_message = self._process_secure_message(message, client_id)
                     if decrypted_message:
                         print(f"\nReceived message from {client_id}: {decrypted_message}\n")
+                        
+                        # Mark that we've received first message from this client
+                        self.received_first_message[client_id] = True
                         
                         # Get session key for encryption
                         session_key = self.key_manager.get_session_key(client_id)
@@ -376,58 +379,81 @@ class Server:
         except Exception as e:
             log_error(ErrorCode.NETWORK_ERROR, f"Failed to send error response: {e}")
 
-    def send_response_message(self, client_id: str, message: str):
-        """Send an encrypted response message to a client with retry mechanism."""
-        retries = 0
-        last_error = None
-        
-        while retries < self.max_retries:
-            try:
-                with self.clients_lock:
-                    if client_id not in self.clients:
-                        log_error(ErrorCode.VALIDATION_ERROR, f"Unknown client ID: {client_id}")
-                        return
-                    client_data = self.clients[client_id]
-                    conn = client_data['connection']
-                    session_key = client_data.get('session_key')
-
-                if not session_key or len(session_key) != CryptoConstants.AES_KEY_SIZE:
-                    log_error(ErrorCode.ENCRYPTION_ERROR, 
-                             f"Invalid session key length. Expected {CryptoConstants.AES_KEY_SIZE} bytes")
-                    return
-
-                # Encrypt and package message
-                iv, ciphertext, tag = Crypto.aes_encrypt(message.encode('utf-8'), session_key)
-                response = packageMessage(
-                    encryptedMessage=ciphertext.hex(),
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=int(time.time()),
-                    type=MessageType.SERVER_RESPONSE.value,
-                    iv=iv.hex(),
-                    tag=tag.hex()
-                )
-                
-                sendData(conn, response)
-                log_event("Message", f"Sent response to client {client_id}")
-                return True
-                
-            except ConnectionError as e:
-                last_error = e
-                retries += 1
-                if retries < self.max_retries:
-                    log_event("Network", f"Retrying send operation ({retries}/{self.max_retries})")
-                    time.sleep(self.retry_delay)
-                continue
-            except Exception as e:
-                log_error(ErrorCode.NETWORK_ERROR, f"Failed to send response message: {e}")
-                self._send_error_response(conn, "Internal server error")
+    def send_response_message(self, client_id: str, message: str) -> bool:
+        """Send an encrypted response message to a client."""
+        try:
+            # Check if we've received first message from this client
+            if not self.received_first_message.get(client_id, False):
+                log_error(ErrorCode.STATE_ERROR, 
+                         f"Cannot send message to {client_id} before receiving first message")
                 return False
-        
-        # If we've exhausted retries, close the connection
-        log_error(ErrorCode.NETWORK_ERROR, f"Failed to send after {self.max_retries} attempts: {last_error}")
-        self.close_client_connection(client_id)
-        return False
+
+            # Get client session key
+            session_key = self.key_manager.get_session_key(client_id)
+            if not session_key:
+                log_error(ErrorCode.SECURITY_ERROR, "No session key available")
+                return False
+
+            # Get client socket
+            with self.clients_lock:
+                if client_id not in self.clients:
+                    log_error(ErrorCode.VALIDATION_ERROR, f"Unknown client ID: {client_id}")
+                    return False
+                client_socket = self.clients[client_id]['socket']
+
+            # Encrypt message
+            ciphertext, nonce, tag = Crypto.encrypt(
+                data=message.encode('utf-8'),
+                key=session_key
+            )
+
+            # Create message data with type
+            message_type = MessageType.DATA.value
+            message_data = {
+                'encryptedMessage': ciphertext.hex(),
+                'signature': '',
+                'nonce': nonce.hex(),
+                'tag': tag.hex(),
+                'timestamp': int(time.time()),
+                'type': message_type,
+                'sender_id': 'server'
+            }
+
+            # Package and send the message
+            response = packageMessage(**message_data)
+            sendData(client_socket, response)
+            log_event("Communication", f"Sent message to client {client_id}")
+
+            # Only wait for acknowledgment if we're sending a DATA message
+            if message_type == MessageType.DATA.value:
+                try:
+                    client_socket.settimeout(5)
+                    ack_data = receiveData(client_socket)
+                    if ack_data:
+                        ack_message = parseMessage(ack_data)
+                        if ack_message.get('type') == MessageType.ACKNOWLEDGE.value:
+                            # Decrypt and log acknowledgment
+                            ciphertext = bytes.fromhex(ack_message['encryptedMessage'])
+                            nonce = bytes.fromhex(ack_message['nonce'])
+                            tag = bytes.fromhex(ack_message['tag'])
+                            
+                            decrypted_ack = Crypto.decrypt(
+                                ciphertext=ciphertext,
+                                key=session_key,
+                                nonce=nonce,
+                                tag=tag
+                            )
+                            log_event("Communication", f"SERVER RECEIVED ACK from {client_id}: {decrypted_ack.decode('utf-8')}")
+                except socket.timeout:
+                    log_event("Communication", f"No acknowledgment received from {client_id} within timeout")
+                finally:
+                    client_socket.settimeout(self.socket_timeout)  # Restore original timeout
+
+            return True
+
+        except Exception as e:
+            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send response message: {e}")
+            return False
 
     def set_message_handler(self, handler):
         """
@@ -921,4 +947,14 @@ class Server:
         except Exception as e:
             log_error(ErrorCode.CRYPTO_ERROR, f"Failed to process secure message: {e}")
             raise
+
+    def get_client_ids(self) -> list:
+        """
+        Get a list of all connected client IDs.
+        
+        Returns:
+            list: List of client IDs currently connected to the server
+        """
+        with self.clients_lock:
+            return list(self.clients.keys())
 

@@ -955,7 +955,51 @@ class Client:
             message_type = message.get('type')
             
             # Handle different message types using enum
-            if message_type == MessageType.ACKNOWLEDGE.value:
+            if message_type == MessageType.DATA.value:
+                # Get session key
+                session_key = self.key_manager.get_session_key(self.client_id)
+                if not session_key:
+                    raise SecurityError("No session key available")
+                
+                # Decrypt message
+                ciphertext = bytes.fromhex(message['encryptedMessage'])
+                nonce = bytes.fromhex(message['nonce'])
+                tag = bytes.fromhex(message['tag'])
+                
+                decrypted_msg = Crypto.decrypt(
+                    ciphertext=ciphertext,
+                    key=session_key,
+                    nonce=nonce,
+                    tag=tag
+                )
+                
+                print(f"\nReceived message from server: {decrypted_msg.decode('utf-8')}\n")
+                
+                # Send acknowledgment
+                ack_content = f"Message received: {decrypted_msg[:20]}..."
+                
+                # Encrypt acknowledgment
+                ciphertext, nonce, tag = Crypto.encrypt(
+                    data=ack_content.encode('utf-8'),
+                    key=session_key
+                )
+                
+                # Package acknowledgment
+                ack_message = packageMessage(
+                    encryptedMessage=ciphertext.hex(),
+                    signature='',
+                    nonce=nonce.hex(),
+                    tag=tag.hex(),
+                    timestamp=int(time.time()),
+                    type=MessageType.ACKNOWLEDGE.value,
+                    sender_id=self.client_id
+                )
+                
+                # Send acknowledgment
+                sendData(self.socket, ack_message)
+                log_event("Communication", "Sent acknowledgment to server")
+                
+            elif message_type == MessageType.ACKNOWLEDGE.value:
                 # Get session key
                 session_key = self.key_manager.get_session_key(self.client_id)
                 if not session_key:
@@ -973,12 +1017,7 @@ class Client:
                     tag=tag
                 )
                 
-                log_event("Communication", f"Received server acknowledgment: {decrypted_ack.decode('utf-8')}")
-                
-            elif message_type == MessageType.DATA.value:
-                decrypted_message = self._handle_data_message(message)
-                if decrypted_message and hasattr(self, 'message_handler') and self.message_handler:
-                    self.message_handler(decrypted_message.decode('utf-8'))
+                log_event("Communication", f"CLIENT RECEIVED ACK Received server acknowledgment: {decrypted_ack.decode('utf-8')}")
                 
             elif message_type == MessageType.KEY_RENEWAL_REQUEST.value:
                 self._handle_key_renewal_request(message)
@@ -1298,13 +1337,8 @@ class Client:
     def _update_activity_timestamp(self):
         """Update the last activity timestamp."""
         try:
-            current_time = time.time()
-            with self._state_lock:
-                self._state['last_activity'] = current_time
-                self._persist_state()
-            with self._storage_lock:
-                self._secure_storage.store('last_activity', current_time)
-            log_event("Connection", "Activity timestamp updated")
+            timestamp = str(time.time()).encode('utf-8')
+            self._secure_storage.store('last_activity', timestamp)
         except Exception as e:
             log_error(ErrorCode.STATE_ERROR, f"Failed to update activity timestamp: {e}")
 

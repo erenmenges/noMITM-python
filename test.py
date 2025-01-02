@@ -59,5 +59,10 @@ time.sleep(2)
 
 logging.info("Cleaning up...")
 time.sleep(5)  # Give server time to clean up
+
+for i in denemeserver.get_client_ids():
+    denemeserver.send_response_message(i, "sago pahasi")
+
 denemeclient.stop_listening()
 denemeclient.terminate_session() 
+
