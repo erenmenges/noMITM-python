@@ -360,7 +360,7 @@ class Crypto:
             ciphertext = ciphertext_with_tag[:-16]
             
             log_event("Crypto", "[CRYPTO] Encryption completed successfully")
-            return ciphertext, nonce, tag, salt
+            return ciphertext, nonce, tag
             
         except Exception as e:
             log_error(ErrorCode.CRYPTO_ERROR, f"[CRYPTO] Encryption failed: {str(e)}")

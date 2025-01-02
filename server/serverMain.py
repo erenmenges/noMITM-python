@@ -280,14 +280,34 @@ class Server:
                     if decrypted_message:
                         print(f"\nReceived message from {client_id}: {decrypted_message}\n")
                         
+                        # Get session key for encryption
+                        session_key = self.key_manager.get_session_key(client_id)
+                        if not session_key:
+                            raise SecurityError("No session key available")
+                        
+                        # Create acknowledgment message
+                        ack_content = f"Message received: {decrypted_message[:20]}..."
+                        
+                        # Encrypt acknowledgment with nonce and tag
+                        ciphertext, nonce, tag = Crypto.encrypt(
+                            ack_content.encode('utf-8'),
+                            session_key
+                        )
+                        
+                        # Package encrypted acknowledgment
+                        response = packageMessage(
+                            encryptedMessage=ciphertext.hex(),
+                            signature='',
+                            nonce=nonce.hex(),
+                            tag=tag.hex(),
+                            timestamp=int(time.time()),
+                            type=MessageType.ACKNOWLEDGE.value,
+                            sender_id='server'
+                        )
+                        
                         # Send acknowledgment
-                        response = {
-                            'type': MessageType.MESSAGE_ACK.value,
-                            'nonce': self.nonce_manager.generate_nonce(),
-                            'timestamp': int(time.time())
-                        }
-                        response_bytes = json.dumps(response).encode('utf-8')
-                        sendData(self.clients[client_id]['socket'], response_bytes)
+                        sendData(self.clients[client_id]['socket'], response)
+                        log_event("Communication", f"Sent acknowledgment to client {client_id}")
                 
             except json.JSONDecodeError as e:
                 log_error(ErrorCode.VALIDATION_ERROR, f"[PROCESS_MESSAGE] JSON decode error: {str(e)}")

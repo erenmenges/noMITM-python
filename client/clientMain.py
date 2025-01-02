@@ -532,7 +532,6 @@ class Client:
             sequence = self.sequence_manager.get_next_sequence()
             
             # Create associated data for authentication - only include stable fields
-            # Use message fields directly to ensure exact match with server
             aad_dict = {
                 'sender_id': self.client_id,
                 'sequence': sequence
@@ -543,7 +542,7 @@ class Client:
             timestamp = int(time.time())
             
             # Encrypt the message with associated data
-            ciphertext, nonce, tag, salt = Crypto.encrypt(
+            ciphertext, nonce, tag = Crypto.encrypt(
                 data=message_bytes,
                 key=session_key,
                 associated_data=associated_data
@@ -561,14 +560,39 @@ class Client:
                 'tag': tag.hex(),
                 'version': 1,
                 'timestamp': timestamp,
-                'sender_id': aad_dict['sender_id'],  # Use exact same value as AAD
-                'sequence': aad_dict['sequence'],    # Use exact same value as AAD
+                'sender_id': aad_dict['sender_id'],
+                'sequence': aad_dict['sequence'],
                 'signature': signature.hex()
             }
             
             # Send the message
             message_bytes = json.dumps(message_data).encode('utf-8')
             sendData(self.socket, message_bytes)
+            
+            # Wait for acknowledgment with timeout
+            try:
+                self.socket.settimeout(5)  # 5 second timeout for ack
+                ack_data = receiveData(self.socket)
+                if ack_data:
+                    ack_message = parseMessage(ack_data)
+                    if ack_message.get('type') == MessageType.ACKNOWLEDGE.value:
+                        # Decrypt and log acknowledgment
+                        ciphertext = bytes.fromhex(ack_message['encryptedMessage'])
+                        nonce = bytes.fromhex(ack_message['nonce'])
+                        tag = bytes.fromhex(ack_message['tag'])
+                        
+                        decrypted_ack = Crypto.decrypt(
+                            ciphertext=ciphertext,
+                            key=session_key,
+                            nonce=nonce,
+                            tag=tag
+                        )
+                        log_event("Communication", f"CLIENT RECEIVED ACK Received server acknowledgment: {decrypted_ack.decode('utf-8')}")
+            except socket.timeout:
+                log_event("Communication", "No acknowledgment received within timeout")
+            finally:
+                self.socket.settimeout(self._connection_timeout)  # Restore original timeout
+            
             return True
             
         except Exception as e:
@@ -648,17 +672,19 @@ class Client:
         """Receive messages with timeout handling."""
         while self.listening:
             try:
-                message = self._perform_with_timeout(
-                    self._receive_message_internal,
-                    'receive'
-                )
-                if message:
-                    self.process_server_message(message)
+                # Receive raw data from socket
+                data = receiveData(self.socket)
+                if data:
+                    # Process the received message
+                    self.process_server_message(data)
+                    # Update activity timestamp
+                    self._update_activity_timestamp()
             except socket.timeout:
                 continue
             except Exception as e:
-                log_error(ErrorCode.NETWORK_ERROR, f"Receive error: {e}")
-                self._check_connection_state()
+                if self.listening:  # Only log if we're still meant to be listening
+                    log_error(ErrorCode.NETWORK_ERROR, f"Receive error: {e}")
+                    self._check_connection_state()
 
     def handle_key_renewal_request(self):
         """Handle key renewal with state synchronization."""
@@ -930,7 +956,24 @@ class Client:
             
             # Handle different message types using enum
             if message_type == MessageType.ACKNOWLEDGE.value:
-                log_event("Communication", "Received server acknowledgment")
+                # Get session key
+                session_key = self.key_manager.get_session_key(self.client_id)
+                if not session_key:
+                    raise SecurityError("No session key available")
+                
+                # Decrypt acknowledgment
+                ciphertext = bytes.fromhex(message['encryptedMessage'])
+                nonce = bytes.fromhex(message['nonce'])
+                tag = bytes.fromhex(message['tag'])
+                
+                decrypted_ack = Crypto.decrypt(
+                    ciphertext=ciphertext,
+                    key=session_key,
+                    nonce=nonce,
+                    tag=tag
+                )
+                
+                log_event("Communication", f"Received server acknowledgment: {decrypted_ack.decode('utf-8')}")
                 
             elif message_type == MessageType.DATA.value:
                 decrypted_message = self._handle_data_message(message)
