@@ -1,9 +1,11 @@
 import json
 import socket
 import time
-from Utils import ErrorCode, log_error, log_event, ErrorMessage
+from Utils import ErrorCode, log_error, log_event, ErrorMessage, CommunicationError
 import threading
 from enum import Enum, auto
+from typing import Optional
+import errno
 
 # Communication Module Functions
 
@@ -222,63 +224,58 @@ def sendData(sock: socket.socket, data: bytes | str) -> bool:
                  f"[COMMUNICATIONS] Failed to send data: {str(e)}")
         raise
 
-def receiveData(conn: socket.socket) -> bytes:
+def receiveData(sock: socket.socket) -> Optional[bytes]:
     """
-    Receives data from a socket.
+    Receive data from socket with proper error handling and timeout.
     
     Args:
-        conn: The socket to receive data from
+        sock: Socket to receive data from
         
     Returns:
-        bytes: The received data
-        
-    Raises:
-        socket.error: If there is an issue with the socket
+        bytes: Received data or None if connection closed
     """
-    log_event("Communications", f"[COMMUNICATIONS] Starting data receive from {conn.getpeername()}")
-    
     try:
-        data = b''
-        total_chunks = 0
-        log_event("Communications", "[COMMUNICATIONS] Initialized receive buffer")
-        
-        while True:
-            log_event("Communications", f"[COMMUNICATIONS] Attempting to receive chunk {total_chunks + 1}")
-            chunk = conn.recv(4096)
+        # Check if socket is still valid
+        if sock.fileno() == -1:
+            log_event("Communications", "[COMMUNICATIONS] Socket is invalid")
+            return None
             
-            if not chunk:
-                log_event("Communications", f"[COMMUNICATIONS] Connection closed by peer {conn.getpeername()}")
+        log_event("Communications", "[COMMUNICATIONS] Starting data receive")
+        
+        # Try to receive initial data
+        chunk = sock.recv(4096)
+        if not chunk:  # Connection closed by peer
+            log_event("Communications", "[COMMUNICATIONS] Connection closed by peer")
+            return None
+            
+        buffer = bytearray(chunk)
+        
+        # Keep receiving until we get a newline or max size
+        while len(buffer) < MAX_MESSAGE_SIZE:
+            if b'\n' in buffer:  # Found message delimiter
                 break
                 
-            data += chunk
-            total_chunks += 1
-            log_event("Communications", 
-                     f"[COMMUNICATIONS] Received chunk {total_chunks} of size {len(chunk)} bytes. "
-                     f"Total received: {len(data)} bytes")
-            
-            if len(chunk) < 4096:
-                log_event("Communications", 
-                         f"[COMMUNICATIONS] Chunk smaller than buffer size ({len(chunk)} < 4096), "
-                         "indicating end of transmission")
-                break
-        
-        if total_chunks == 0:
-            log_event("Communications", "[COMMUNICATIONS] No data received before connection closed")
-        else:
-            log_event("Communications", 
-                     f"[COMMUNICATIONS] Data receive complete. Total chunks: {total_chunks}, "
-                     f"Total bytes: {len(data)}")
-        
-        return data
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:  # Connection closed
+                    break
+                buffer.extend(chunk)
+            except socket.timeout:
+                if buffer:  # Return partial data on timeout if we have any
+                    break
+                return None
+                
+        return bytes(buffer) if buffer else None
         
     except socket.error as e:
-        log_error(ErrorCode.NETWORK_ERROR, 
-                 f"[COMMUNICATIONS] Socket error during receive from {conn.getpeername()}: {e}")
-        raise
+        if isinstance(e, socket.timeout):
+            return None
+        log_error(ErrorCode.NETWORK_ERROR, f"Socket error during receive: {e}")
+        return None
+        
     except Exception as e:
-        log_error(ErrorCode.NETWORK_ERROR, 
-                 f"[COMMUNICATIONS] Unexpected error during receive from {conn.getpeername()}: {e}")
-        raise
+        log_error(ErrorCode.GENERAL_ERROR, f"Error receiving data: {e}")
+        return None
 
 # Key Renewal Messages
 

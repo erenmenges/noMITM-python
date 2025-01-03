@@ -44,7 +44,7 @@ from Utils import (
     CommunicationError,
     TimeoutError
 )
-from security.TLSWrapper import TLSWrapper
+from security.TLSWrapper import TLSWrapper, TLSConfig
 from security.secure_storage import SecureStorage
 
 @contextmanager
@@ -74,12 +74,15 @@ class Client:
         max_message_size (int): Maximum allowed message size in bytes
     """
 
-    def __init__(self):
+    def __init__(self, tls_config=None):
         """Initialize the client with secure defaults."""
         self._lock = threading.Lock()
         self._connection_timeout = 30
         self._message_timeout = 300
         self._max_message_size = 1024 * 1024
+        
+        # Initialize TLS config
+        self.tls_config = tls_config or TLSConfig(enabled=False)
         
         # Initialize secure storage ONCE
         self._secure_storage = SecureStorage()
@@ -331,6 +334,29 @@ class Client:
                 local_addr = self.socket.getsockname()
                 log_event("Session", f"[SECURE_SESSION] Local endpoint: {local_addr[0]}:{local_addr[1]}")
                 log_event("Session", f"[SECURE_SESSION] Remote endpoint: {destination[0]}:{destination[1]}")
+                
+                # Wrap socket with TLS if enabled
+                if self.tls_config and self.tls_config.enabled:
+                    log_event("Security", "[SECURE_SESSION] Wrapping socket with TLS")
+                    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                    
+                    # Load certificates
+                    context.load_cert_chain(
+                        certfile=str(self.tls_config.cert_path),
+                        keyfile=str(self.tls_config.key_path)
+                    )
+                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
+                    
+                    if self.tls_config.verify_mode == "CERT_REQUIRED":
+                        context.verify_mode = ssl.CERT_REQUIRED
+                        context.check_hostname = True
+                    
+                    # Wrap the socket
+                    self.socket = context.wrap_socket(
+                        self.socket,
+                        server_hostname=destination[0]
+                    )
+                    log_event("Security", "[SECURE_SESSION] TLS handshake completed")
                 
             except Exception as e:
                 log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] Failed to create/connect socket: {str(e)}")
@@ -1707,4 +1733,22 @@ class Client:
         except Exception as e:
             log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange response handling failed: {e}")
             return False
+
+    def cleanup(self):
+        """Clean up client resources."""
+        try:
+            if hasattr(self, 'socket') and self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
+                try:
+                    self.socket.close()
+                except:
+                    pass
+                self.socket = None
+                
+            log_event("Client", "Cleanup completed successfully")
+        except Exception as e:
+            log_error(ErrorCode.CLEANUP_ERROR, f"Error during cleanup: {e}")
 

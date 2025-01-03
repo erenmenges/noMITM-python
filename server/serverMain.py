@@ -6,6 +6,7 @@ import os
 from typing import Dict, Optional, Tuple
 from datetime import datetime
 import traceback
+import ssl
 
 # Cryptography imports
 from cryptography.hazmat.primitives import serialization, hashes
@@ -50,12 +51,19 @@ from security.secure_storage import SecureStorage
 from config.security_config import TLSConfig
 
 class Server:
-    def __init__(self, host: str, port: int, tls_config=None):
+    def __init__(self, host: str, port: int, tls_config: Optional[TLSConfig] = None):
+        """Initialize server with optional TLS configuration.
+        
+        Args:
+            host (str): Host address to bind to
+            port (int): Port to listen on
+            tls_config (Optional[TLSConfig]): TLS configuration, defaults to disabled
+        """
         self.host = host
         self.port = port
         self.socket_timeout = 30
         # Initialize with default values
-        self.tls_config = tls_config or TLSConfig(enabled=False)  # Default to disabled TLS
+        self.tls_config = tls_config or TLSConfig(enabled=False)
         self._lock = threading.Lock()
         self.clients_lock = threading.Lock()
         self.clients: Dict[str, dict] = {}
@@ -89,17 +97,19 @@ class Server:
     def _initialize_certificates(self):
         """Initialize server certificates and validation chain."""
         try:
+            # First generate a key pair if one doesn't exist
+            if not self.key_manager.has_key_pair():
+                self.key_manager.generate_key_pair()
+            
             # Load server certificate and private key
             self.certificate = self.key_manager.load_certificate(
-                self.tls_config.cert_config.cert_path
+                str(self.tls_config.cert_path)
             )
-            self.private_key = self.key_manager.load_private_key(
-                self.tls_config.cert_config.key_path
-            )
+            self.private_key = self.key_manager.get_private_key()
             
             # Load CA certificate for client validation
             self.ca_certificate = self.key_manager.load_certificate(
-                self.tls_config.cert_config.ca_cert_path
+                str(self.tls_config.ca_path)
             )
             
             log_event("Security", "Server certificates initialized successfully")
@@ -761,14 +771,39 @@ class Server:
             # TLS handling
             client_cert = None
             if self.tls_config and self.tls_config.enabled:
-                log_event("Security", f"[HANDLE_CLIENT] TLS enabled, validating certificate for {address}")
-                if self.tls_config.cert_config.require_client_cert:
-                    client_cert = self._validate_client_certificate(client_socket)
-                    if not client_cert:
-                        log_error(ErrorCode.AUTHENTICATION_ERROR, f"Certificate validation failed for {address}")
-                        client_socket.close()
-                        return
-                    log_event("Security", f"[HANDLE_CLIENT] Certificate validated for {address}")
+                log_event("Security", f"[HANDLE_CLIENT] TLS enabled, wrapping socket for {address}")
+                try:
+                    # Create TLS context
+                    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                    
+                    # Configure TLS settings
+                    context.load_cert_chain(
+                        certfile=str(self.tls_config.cert_path),
+                        keyfile=str(self.tls_config.key_path)
+                    )
+                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
+                    
+                    if self.tls_config.verify_mode == "CERT_REQUIRED":
+                        context.verify_mode = ssl.CERT_REQUIRED
+                    
+                    # Wrap socket
+                    client_socket = context.wrap_socket(
+                        client_socket,
+                        server_side=True,
+                        do_handshake_on_connect=True
+                    )
+                    
+                    # Now we can validate the certificate
+                    if self.tls_config.verify_mode == "CERT_REQUIRED":
+                        client_cert = client_socket.getpeercert()
+                        if not client_cert:
+                            raise ValueError("No client certificate provided")
+                        log_event("Security", f"[HANDLE_CLIENT] Certificate validated for {address}")
+                        
+                except Exception as e:
+                    log_error(ErrorCode.AUTHENTICATION_ERROR, f"TLS setup failed: {e}")
+                    client_socket.close()
+                    return
             
             # Set socket timeout
             log_event("Connection", f"[HANDLE_CLIENT] Attempting to set socket timeout to {self.socket_timeout}")
@@ -780,23 +815,21 @@ class Server:
             log_event("Connection", f"[HANDLE_CLIENT] Generated client ID: {client_id}")
 
             # Store client information
-            log_event("Connection", f"[HANDLE_CLIENT] Attempting to acquire clients lock for {client_id}")
+            log_event("Connection", f"[HANDLE_CLIENT] Storing client information for {client_id}")
             with self.clients_lock:
-                log_event("Connection", f"[HANDLE_CLIENT] Lock acquired for {client_id}")
                 self.clients[client_id] = {
-                'address': address,
-                'last_activity': time.time(),
-                'messages_received': 0,
-                'socket': client_socket,
-                'certificate': client_cert
+                    'address': address,
+                    'last_activity': time.time(),
+                    'messages_received': 0,
+                    'socket': client_socket,
+                    'certificate': client_cert
                 }
-                log_event("Connection", f"[HANDLE_CLIENT] Client info stored: {self.clients[client_id]}")
-            log_event("Connection", f"[HANDLE_CLIENT] Lock released for {client_id}")
+                log_event("Connection", f"[HANDLE_CLIENT] Client information stored successfully")
             
             # Start message handling loop
             log_event("Communication", f"[HANDLE_CLIENT] Starting message handling loop for {client_id}")
             self._handle_messages(client_id)
-                    
+                
         except Exception as e:
             log_error(ErrorCode.CONNECTION_ERROR, f"Error handling client {address}: {e}")
             log_error(ErrorCode.CONNECTION_ERROR, f"Exception type: {type(e)}")
@@ -811,36 +844,35 @@ class Server:
     def _handle_messages(self, client_id: str):
         """Handle incoming messages from a client."""
         try:
-            log_event("Communication", f"[HANDLE_MESSAGES] Starting message handler for {client_id}")
-            client_socket = self.clients[client_id]['socket']
+            client_info = self.clients[client_id]
+            client_socket = client_info['socket']
             
             while True:
                 try:
-                    log_event("Communication", f"[HANDLE_MESSAGES] Waiting for data from {client_id}")
                     data = receiveData(client_socket)
-                    log_event("Communication", f"[HANDLE_MESSAGES] Received {len(data)} bytes from {client_id}")
+                    if data is None:  # Connection closed or error
+                        log_event("Connection", f"[HANDLE_MESSAGES] Client {client_id} disconnected")
+                        break  # Exit the loop when connection is closed
                     
-                    # Update client activity
+                    # Process the received data
                     self._update_client_activity(client_id)
-                    
-                    # Process the message
-                    log_event("Communication", f"[HANDLE_MESSAGES] Processing message for {client_id}")
                     self.process_client_message(data, client_id)
                     
                 except socket.timeout:
-                    log_event("Communication", f"[HANDLE_MESSAGES] Socket timeout for {client_id}")
-                    continue
+                    continue  # Just continue on timeout
+                except socket.error as e:
+                    log_error(ErrorCode.NETWORK_ERROR, f"Socket error for client {client_id}: {e}")
+                    break
+                except CommunicationError as e:
+                    log_error(ErrorCode.COMMUNICATION_ERROR, f"Communication error for client {client_id}: {e}")
+                    break
                 except Exception as e:
-                        log_error(ErrorCode.COMMUNICATION_ERROR, f"Error handling messages for {client_id}: {e}")
-                        log_error(ErrorCode.COMMUNICATION_ERROR, f"Stack trace: {traceback.format_exc()}")
-                        break
-                    
-        except Exception as e:
-            log_error(ErrorCode.COMMUNICATION_ERROR, f"Fatal error in message handler for {client_id}: {e}")
-            log_error(ErrorCode.COMMUNICATION_ERROR, f"Stack trace: {traceback.format_exc()}")
+                    log_error(ErrorCode.GENERAL_ERROR, f"Error handling message from {client_id}: {e}")
+                    break
+                
         finally:
-            log_event("Communication", f"[HANDLE_MESSAGES] Cleaning up connection for {client_id}")
-            self._cleanup_client(client_id)
+            # Clean up client connection
+            self._cleanup_client(client_id)  # Use the dedicated cleanup method
 
     def _update_client_activity(self, client_id: str):
         """Update the last activity timestamp for a client."""
@@ -861,24 +893,30 @@ class Server:
         try:
             with self.clients_lock:
                 if client_id in self.clients:
+                    client_info = self.clients[client_id]
+                    
                     # Close socket
                     try:
-                        socket = self.clients[client_id]['socket']
-                        if socket.fileno() != -1:
-                            socket.close()
+                        if client_info['socket'].fileno() != -1:
+                            try:
+                                client_info['socket'].shutdown(socket.SHUT_RDWR)
+                            except:
+                                pass
+                            client_info['socket'].close()
                     except:
                         pass
                     
                     # Remove from clients dict
                     del self.clients[client_id]
                     
-                    # Clean up any session keys
+                    # Clean up session keys
                     try:
                         self._secure_storage.remove(f'session_key_{client_id}')
                     except:
                         pass
                     
                     log_event("Connection", f"[CLEANUP] Cleaned up resources for client {client_id}")
+                
         except Exception as e:
             log_error(ErrorCode.CLEANUP_ERROR, f"Error cleaning up client {client_id}: {e}")
 
