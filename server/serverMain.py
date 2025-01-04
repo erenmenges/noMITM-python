@@ -266,6 +266,21 @@ class Server:
     def process_client_message(self, data: bytes, client_id: str):
         """Process a message received from a client."""
         try:
+            # Add validation
+            if not data or not client_id:
+                raise ValueError("Invalid message data or client ID")
+            
+            if client_id not in self.clients:
+                raise ValueError("Unknown client ID")
+            
+            message = json.loads(data.decode('utf-8'))
+            
+            # Handle session termination
+            if message.get('type') == MessageType.SESSION_TERMINATION.value:
+                log_event("Connection", f"Received termination request from {client_id}")
+                self.close_client_connection(client_id)
+                return
+            
             log_event("Communication", f"[PROCESS_MESSAGE] Processing message for client {client_id}")
             log_event("Communication", f"[PROCESS_MESSAGE] Raw message size: {len(data)} bytes")
             
@@ -327,8 +342,10 @@ class Server:
                 message = parseMessage(data)
 
         except Exception as e:
-            log_error(ErrorCode.GENERAL_ERROR, f"[PROCESS_MESSAGE] Error processing message: {str(e)}")
-            log_error(ErrorCode.GENERAL_ERROR, f"[PROCESS_MESSAGE] Exception type: {type(e)}")
+            log_error(ErrorCode.GENERAL_ERROR, f"Error processing message: {e}")
+            # Consider closing connection on critical errors
+            if isinstance(e, (SecurityError, StateError)):
+                self.close_client_connection(client_id)
 
     def _handle_key_exchange(self, message: dict, client_id: str) -> None:
         """Handle key exchange request from client."""
@@ -826,9 +843,18 @@ class Server:
                 }
                 log_event("Connection", f"[HANDLE_CLIENT] Client information stored successfully")
             
-            # Start message handling loop
-            log_event("Communication", f"[HANDLE_CLIENT] Starting message handling loop for {client_id}")
-            self._handle_messages(client_id)
+            # Add connection state tracking
+            with self.clients_lock:
+                self.clients[client_id]['connection_state'] = 'connected'
+            
+            # Handle cleanup on exit    
+            try:
+                self._handle_messages(client_id)
+            finally:
+                with self.clients_lock:
+                    if client_id in self.clients:
+                        self.clients[client_id]['connection_state'] = 'disconnected'
+                self._cleanup_client(client_id)
                 
         except Exception as e:
             log_error(ErrorCode.CONNECTION_ERROR, f"Error handling client {address}: {e}")

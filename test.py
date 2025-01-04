@@ -49,16 +49,12 @@ if success:
     test_message = "ceza sahasi"
     if denemeclient.send_message(test_message):
         logging.info(f"Message sent: {test_message}")
-        # Wait for server response and client acknowledgment
-        time.sleep(2)  # Give time for message processing and response
 else:
     logging.error("Failed to establish secure session")
 
 # Keep the program running to see the interaction
-time.sleep(2)
 
-logging.info("Cleaning up...")
-time.sleep(5)  # Give server time to clean up
+time.sleep(1)  # Give server time to clean up
 
 for i in denemeserver.get_client_ids():
     denemeserver.send_response_message(i, "sago pahasi")

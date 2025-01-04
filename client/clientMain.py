@@ -809,6 +809,16 @@ class Client:
     def terminate_session(self):
         """Enhanced session termination with state and resource cleanup."""
         try:
+            # Should add a termination message to server before cleanup
+            termination_message = packageMessage(
+                encryptedMessage='',
+                signature='',
+                nonce=self.nonce_manager.generate_nonce(),
+                timestamp=int(time.time()),
+                type=MessageType.SESSION_TERMINATION.value
+            )
+            sendData(self.socket, termination_message)  # Add this
+            
             self._update_state({
                 'connection_active': False,
                 'session_established': False,
@@ -1363,47 +1373,49 @@ class Client:
     def _update_activity_timestamp(self):
         """Update the last activity timestamp."""
         try:
-            timestamp = str(time.time()).encode('utf-8')
-            self._secure_storage.store('last_activity', timestamp)
+            # Store as string representation of float
+            timestamp = str(time.time())
+            self._secure_storage.store('last_activity', timestamp.encode('utf-8'))
         except Exception as e:
             log_error(ErrorCode.STATE_ERROR, f"Failed to update activity timestamp: {e}")
 
     def _heartbeat_loop(self):
         """Send periodic heartbeats to keep connection alive."""
-        log_event("Connection", "Starting heartbeat loop")
         while self.is_connected():
             try:
-                if not self._connected:  # Check before sleep
+                if not self._connected:
                     break
                     
                 time.sleep(self._heartbeat_interval)
                 
-                heartbeat_message = {
-                    'encryptedMessage': '',
-                    'signature': '',
-                    'nonce': self.nonce_manager.generate_nonce(),
-                    'timestamp': int(time.time()),
-                    'type': MessageType.KEEPALIVE.value,
-                    'sequence': self.sequence_manager.get_next_sequence(),
-                    'sender_id': str(id(self))
-                }
-                
-                message_bytes = json.dumps(heartbeat_message).encode('utf-8')
-                
+                # Check connection state before sending
+                if not self.is_connected() or not self._connected:
+                    break
+                    
                 with self._send_lock:
-                        try:
-                            sendData(self.socket, message_bytes)  # Send raw bytes
-                            self._update_activity_timestamp()
-                            log_event("Connection", "Heartbeat sent successfully")
-                        except Exception as e:
-                            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send heartbeat: {e}")
-                            raise
+                    try:
+                        # Create proper heartbeat message with all required fields
+                        heartbeat_message = packageMessage(
+                            encryptedMessage='',  # Empty but included
+                            signature='',
+                            nonce=self.nonce_manager.generate_nonce(),
+                            timestamp=int(time.time()),
+                            type=MessageType.KEEPALIVE.value,
+                            sequence=self.sequence_manager.get_next_sequence(),
+                            sender_id=self.client_id
+                        )
+                        sendData(self.socket, heartbeat_message)
+                        self._update_activity_timestamp()
+                        log_event("Connection", "Heartbeat sent successfully")
+                    except Exception as e:
+                        log_error(ErrorCode.NETWORK_ERROR, f"Failed to send heartbeat: {e}")
+                        self._handle_connection_failure()
+                        break
                     
             except Exception as e:
                 log_error(ErrorCode.NETWORK_ERROR, f"Heartbeat failed: {e}")
-                if self.is_connected():
-                    self._handle_send_failure()
-                    break  # Exit loop on failure
+                self._handle_connection_failure()
+                break
 
     def _cleanup_loop(self):
         """Periodically check and cleanup stale connection state."""
@@ -1421,7 +1433,9 @@ class Client:
                 return
 
             current_time = time.time()
-            last_activity = self._secure_storage.retrieve('last_activity') or 0
+            last_activity_bytes = self._secure_storage.retrieve('last_activity')
+            # Convert bytes to float
+            last_activity = float(last_activity_bytes.decode('utf-8')) if last_activity_bytes else 0
 
             if current_time - last_activity > self._activity_timeout:
                 log_error(ErrorCode.CONNECTION_ERROR, "Connection inactive, terminating")
@@ -1751,4 +1765,93 @@ class Client:
             log_event("Client", "Cleanup completed successfully")
         except Exception as e:
             log_error(ErrorCode.CLEANUP_ERROR, f"Error during cleanup: {e}")
+
+    def shutdown(self):
+        """Graceful shutdown with proper cleanup."""
+        try:
+            # Set flags first to stop threads
+            self.running = False
+            self._connected = False
+            self.listening = False
+            
+            # Send termination message if still connected
+            if self.socket and self.socket.fileno() != -1:
+                try:
+                    termination_message = packageMessage(
+                        encryptedMessage='',
+                        signature='',
+                        nonce=self.nonce_manager.generate_nonce(),
+                        timestamp=int(time.time()),
+                        type=MessageType.SESSION_TERMINATION.value
+                    )
+                    sendData(self.socket, termination_message)
+                except:
+                    pass
+            
+            # Wait for threads to finish
+            if hasattr(self, '_heartbeat_thread') and self._heartbeat_thread:
+                self._heartbeat_thread.join(timeout=2)
+            if hasattr(self, 'listen_thread') and self.listen_thread:
+                self.listen_thread.join(timeout=2)
+            
+            # Then cleanup resources
+            self.terminate_session()
+            
+        except Exception as e:
+            log_error(ErrorCode.CLEANUP_ERROR, f"Error during shutdown: {e}")
+
+    def _attempt_reconnection(self) -> bool:
+        """Attempt to reconnect to the server."""
+        try:
+            for attempt in range(self.max_retries):
+                log_event("Connection", f"Reconnection attempt {attempt + 1}/{self.max_retries}")
+                try:
+                    # Create new socket
+                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.socket.settimeout(self._connection_timeout)
+                    self.socket.connect(self.destination)
+                    
+                    # Re-establish secure session
+                    if self._establish_secure_session():
+                        return True
+                    
+                except Exception as e:
+                    log_error(ErrorCode.NETWORK_ERROR, f"Reconnection attempt failed: {e}")
+                    time.sleep(self.retry_delay * (attempt + 1))
+                
+            return False
+            
+        except Exception as e:
+            log_error(ErrorCode.NETWORK_ERROR, f"Reconnection failed: {e}")
+            return False
+
+    def _handle_connection_failure(self):
+        """Handle connection failures gracefully."""
+        try:
+            with self._state_lock:
+                self._connected = False
+                self._update_state({
+                    'connection_active': False,
+                    'session_established': False,
+                    'key_exchange_complete': False,
+                    'last_activity': time.time()  # Update last activity
+                })
+                
+                # Try to close socket gracefully
+                if self.socket:
+                    try:
+                        self.socket.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass
+                    try:
+                        self.socket.close()
+                    except:
+                        pass
+                    self.socket = None
+                
+                # Notify about connection failure
+                self._notify_state_change(False)
+                
+        except Exception as e:
+            log_error(ErrorCode.CONNECTION_ERROR, f"Error handling connection failure: {e}")
 
