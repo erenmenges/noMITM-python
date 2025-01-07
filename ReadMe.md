@@ -87,7 +87,6 @@ Secure Memory Clearance
 
 This project implements a robust and secure client-server communication system designed for applications requiring high-security standards and reliable data exchange. The system prioritizes security, scalability, and reliability through several key architectural decisions:
 
-
 ## Security Features
 
 ### Cryptographic Operations
@@ -139,7 +138,6 @@ This project implements a robust and secure client-server communication system d
   - Memory wiping for sensitive data
   - Thread-safe operations with proper locking
   - Connection state monitoring and cleanup
-
 
 ## Shortcomings and Known Limitations
 
@@ -261,18 +259,28 @@ success = client.establish_secure_session(("localhost", 12345))
 #### Server Public Methods
 
 start(): Starts the server and begins accepting connections
+
 shutdown(): Gracefully shuts down the server and cleans up resources
+
 get_client_ids() -> list: Returns list of connected client IDs
+
 close_client_connection(client_id: str): Closes connection with specific client
+
 send_message(client_id: str, message: str) -> bool: Sends encrypted message to specific client
 
 #### Client Public Methods
 
 establish_secure_session(destination: Tuple[str, int]) -> bool: Establishes secure connection with server
+
 send_message(message: str) -> bool: Sends encrypted message to server
 start_listening(): Starts listening for incoming messages
+
 stop_listening(): Stops listening for messages
+
 shutdown(): Gracefully closes connection and cleans up resources
+
 is_connected() -> bool: Checks if client has active connection
+
 register_error_handler(handler): Registers callback for error notifications
+
 register_state_change_handler(handler): Registers callback for connection state changes.
