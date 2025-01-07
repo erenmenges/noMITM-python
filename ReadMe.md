@@ -2,6 +2,10 @@
 
 This project implements a secure and scalable client-server communication system designed to facilitate encrypted message exchanges. The system comprises two main components: the Server (serverMain.py) and the Client (clientMain.py). Both components are designed to ensure data confidentiality, integrity, and authenticity.
 
+## Warning
+
+This project is a work in progress and is not yet ready for production use. It is a proof of concept. Although it is THOROUGHLY tested and IT WORKS, some parts, especially the TLS mode, are not yet tested for a real-world scenario. Please reach out for any security concerns.
+
 ## Table of Contents
 
 1. [Purpose](#purpose)
@@ -21,8 +25,6 @@ This project implements a secure and scalable client-server communication system
 5. [Installation](#installation)
    - [Prerequisites](#prerequisites)
    - [Step-by-Step Guide](#step-by-step-installation)
-
-
 
 ## Purpose
 
