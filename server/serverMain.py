@@ -821,6 +821,7 @@ class Server:
                     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
                     
                     # Configure TLS settings
+                    context.minimum_version = ssl.TLSVersion.TLSv1_2  # Explicitly sets minimum to TLS 1.2
                     context.load_cert_chain(
                         certfile=str(self.tls_config.cert_path),
                         keyfile=str(self.tls_config.key_path)
