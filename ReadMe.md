@@ -2,28 +2,27 @@
 
 This project implements a secure and scalable client-server communication system designed to facilitate encrypted message exchanges. The system comprises two main components: the Server (serverMain.py) and the Client (clientMain.py). Both components are designed to ensure data confidentiality, integrity, and authenticity.
 
-Key Features
-Secure Communication with TLS:
-TLS Integration
-Certificate Validation
-Configurable TLS Settings
+## Table of Contents
 
-Cryptographic Key Management:
-Key Generation and Storage
-Session Key Derivation using ECDH
-Key Renewal and Failure Handling
+1. [Purpose](#purpose)
+2. [Security Features](#security-features)
+   - [Cryptographic Operations](#cryptographic-operations)
+   - [Transport Security](#transport-security)
+   - [Message Security](#message-security)
+   - [Resource Management](#resource-management)
+3. [Limitations](#shortcomings-and-known-limitations)
+   - [Security Considerations](#security-considerations)
+   - [Protocol Restrictions](#protocol-restrictions)
+4. [Usage](#usage)
+   - [Default Mode](#default-mode-no-tls)
+   - [TLS Mode](#tls-mode)
+   - [Server Methods](#server-public-methods)
+   - [Client Methods](#client-public-methods)
+5. [Installation](#installation)
+   - [Prerequisites](#prerequisites)
+   - [Step-by-Step Guide](#step-by-step-installation)
 
-Robust Session Management:
-Session Establishment
-Heartbeat Mechanism
-Activity Tracking
-Concurrent Client Handling
-Thread-Safe Operations
 
-Comprehensive Error Handling and Logging:
-Detailed Logging
-Resource Management and Cleanup
-Secure Memory Clearance
 
 ## Purpose
 
@@ -286,4 +285,5 @@ register_state_change_handler(handler): Registers callback for connection state 
      "ca_path": "path/to/ca.crt"
    }
    ```
-   
+
+
