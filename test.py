@@ -4,6 +4,8 @@ import time
 import logging
 from config.security_config import TLSConfig
 from pathlib import Path
+import socket
+from Communications import MessageType
 
 # Configure logging
 logging.basicConfig(
@@ -25,40 +27,62 @@ server_tls_config = TLSConfig(
 )
 
 # Create instances with TLS config
-denemeclient = client.clientMain.Client()
-denemeclient.tls_config = client_tls_config
+denemeclient = None
+denemeserver = None
 
-denemeserver = server.serverMain.Server("127.0.0.1", 12345, tls_config=server_tls_config)
-# Set message handler for server using proper method
-denemeserver.set_message_handler(server_message_handler)
+try:
+    denemeclient = client.clientMain.Client()
+    denemeclient.tls_config = client_tls_config
 
-logging.info("Starting server...")
-denemeserver.start()
-time.sleep(1)  # Give server time to start
+    denemeserver = server.serverMain.Server("127.0.0.1", 12345, tls_config=server_tls_config)
+    denemeserver.set_message_handler(server_message_handler)
 
-logging.info("Attempting to establish secure session...")
-success = denemeclient.establish_secure_session(("127.0.0.1", 12345))
-if success:
+    logging.info("Starting server...")
+    denemeserver.start()
+    time.sleep(0.1)  # Give server time to start
+
+    logging.info("Attempting to establish secure session...")
+    if not denemeclient.establish_secure_session(("127.0.0.1", 12345)):
+        raise RuntimeError("Failed to establish secure session")
+    
     logging.info("Secure session established")
     
-    # Start client's message listener
+    # Start listening for messages
     denemeclient.start_listening()
-    time.sleep(1)  # Give listener time to start
+    logging.info("Started listening for messages")
     
+    # Send test message
     logging.info("Sending test message...")
-    test_message = "ceza sahasi"
-    if denemeclient.send_message(test_message):
-        logging.info(f"Message sent: {test_message}")
-else:
-    logging.error("Failed to establish secure session")
+    if not denemeclient.send_message("ceza sahasi"):
+        raise RuntimeError("Failed to send message")
+    
+    logging.info("Message sent: ceza sahasi")
+    time.sleep(0.1)  # Wait for server response
+    
+    # Send server response
+    client_ids = denemeserver.get_client_ids()
+    if not client_ids:
+        raise RuntimeError("No connected clients found")
+        
+    for client_id in client_ids:
+        if not denemeserver.send_message(client_id, "sago pahasi"):
+            raise RuntimeError(f"Failed to send response to client {client_id}")
+        time.sleep(0.1)  # Wait for message exchange to complete
+    
+    # Wait for message exchange to complete
+    time.sleep(0.2)
 
-# Keep the program running to see the interaction
+except Exception as e:
+    logging.error(f"Test failed with error: {e}")
+    raise
 
-time.sleep(1)  # Give server time to clean up
-
-for i in denemeserver.get_client_ids():
-    denemeserver.send_response_message(i, "sago pahasi")
-
-denemeclient.stop_listening()
-denemeclient.terminate_session() 
+finally:
+    try:
+        # Now we can shutdown
+        if denemeclient:
+            denemeclient.shutdown()
+        if denemeserver:
+            denemeserver.shutdown()
+    except Exception as e:
+        logging.error(f"Shutdown failed: {e}")
 

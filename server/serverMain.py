@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 from datetime import datetime
 import traceback
 import ssl
+import errno
 
 # Cryptography imports
 from cryptography.hazmat.primitives import serialization, hashes
@@ -119,43 +120,62 @@ class Server:
             raise
 
     def start(self):
-        """Start the server with proper error handling."""
+        """Start the server."""
         try:
+            if not self._initialized:
+                raise StateError("Server not properly initialized")
+            
+            self.running = True
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
-            self.running = True
+            
             log_event("Server", f"Server started on {self.host}:{self.port}")
             
-            # Start accept loop in a separate thread
+            # Start accept thread
             self._accept_thread = threading.Thread(target=self._accept_connections)
-            self._accept_thread.daemon = True
+            self._accept_thread.daemon = True  # Make thread daemon so it exits when main thread exits
             self._accept_thread.start()
             
         except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Failed to start server: {e}")
+            self.running = False
+            log_error(ErrorCode.STARTUP_ERROR, f"Failed to start server: {e}")
             raise
 
     def _accept_connections(self):
-        """Accept incoming connections with proper error handling."""
-        while self.running:
-            try:
-                log_event("Server", "Waiting for incoming connection...")
-                client_socket, address = self.server_socket.accept()
-                log_event("Server", f"Accepted connection from {address[0]}:{address[1]}")
+        """Accept incoming connections."""
+        try:
+            # Don't set a timeout - let accept() block
+            self.server_socket.settimeout(None)
+            
+            while self.running:
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    if not self.running:
+                        client_socket.close()
+                        return
+                    
+                    log_event("Server", f"Accepted connection from {client_address[0]}:{client_address[1]}")
+                    
+                    # Start client handler thread
+                    client_thread = threading.Thread(
+                        target=self._handle_client,
+                        args=(client_socket, client_address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error:
+                    if not self.running:
+                        return
+                    # Only raise if we're still supposed to be running
+                    if self.running:
+                        raise
                 
-                # Handle client in separate thread
-                client_thread = threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-                
-            except Exception as e:
-                if self.running:  # Only log if server is still meant to be running
-                    log_error(ErrorCode.NETWORK_ERROR, f"Error accepting connection: {e}")
+        except Exception as e:
+            if self.running:
+                log_error(ErrorCode.GENERAL_ERROR, f"Error in accept loop: {e}")
 
     def cleanup_inactive_clients(self):
         """Remove inactive client connections."""
@@ -216,52 +236,40 @@ class Server:
 
     def shutdown(self):
         """Shutdown the server and cleanup all resources."""
-        self.running = False
-        
-        # Close all client connections
-        client_ids = list(self.clients.keys())  # Create a copy of keys
-        for client_id in client_ids:
-            try:
-                # Send termination message to clients
-                client_data = self.clients[client_id]
-                conn = client_data['connection']
-                termination_message = packageMessage(
-                    encryptedMessage='',
-                    signature='',
-                    nonce=self.nonce_manager.generate_nonce(),
-                    timestamp=int(time.time()),
-                    type=MessageType.SESSION_TERMINATION
-                )
+        try:
+            log_event("Server", "Starting server shutdown...")
+            self.running = False  # Signal threads to stop
+            
+            # Force accept loop to exit
+            self._force_accept_exit()
+            
+            # Close all client connections first
+            with self.clients_lock:
+                client_ids = list(self.clients.keys())
+                for client_id in client_ids:
+                    self._cleanup_client(client_id)
+                self.clients.clear()
+            
+            # Close server socket
+            if self.server_socket:
                 try:
-                    sendData(conn, termination_message)
-                except Exception:
-                    pass  # Continue cleanup even if sending fails
-                
-                # Close connection
-                self.close_client_connection(client_id)
-                
-            except Exception as e:
-                log_error(ErrorCode.NETWORK_ERROR, f"Error during client cleanup: {e}")
-
-        # Close server socket
-        if self.server_socket:
-            try:
-                self.server_socket.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
-            self.server_socket = None
-
-        # Clear all internal state
-        self.clients.clear()
-        self.key_manager.clear_session_keys()
-        self.nonce_manager.cleanup_old_nonces()
-        
-        log_event("Server", "Server shutdown complete")
-
+                    self.server_socket.close()
+                    self.server_socket = None
+                except socket.error:
+                    pass
+            
+            # Wait for accept thread to finish
+            if hasattr(self, '_accept_thread') and self._accept_thread.is_alive():
+                self._accept_thread.join(timeout=2)
+            
+            # Stop cleanup thread if exists
+            if hasattr(self, 'key_manager'):
+                self.key_manager.stop_cleanup_thread()
+            
+            log_event("Server", "Server shutdown completed")
+            
+        except Exception as e:
+            log_error(ErrorCode.SHUTDOWN_ERROR, f"Error during server shutdown: {e}")
 
     def process_client_message(self, data: bytes, client_id: str):
         """Process a message received from a client."""
@@ -347,10 +355,10 @@ class Server:
             if isinstance(e, (SecurityError, StateError)):
                 self.close_client_connection(client_id)
 
-    def _handle_key_exchange(self, message: dict, client_id: str) -> None:
+    def _handle_key_exchange(self, message: dict, client_id: str):
         """Handle key exchange request from client."""
         try:
-                # Load client's public key
+            # Load client's public key
             client_public_key = serialization.load_pem_public_key(
                 message['public_key'].encode('utf-8'),
                 backend=default_backend()
@@ -390,6 +398,7 @@ class Server:
                 
         except Exception as e:
             log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange failed: {e}")
+            self.send_message(client_id, "Key exchange failed", MessageType.ERROR)
             raise
 
     def _send_error_response(self, conn: socket.socket, error_message: str):
@@ -406,53 +415,73 @@ class Server:
         except Exception as e:
             log_error(ErrorCode.NETWORK_ERROR, f"Failed to send error response: {e}")
 
-    def send_response_message(self, client_id: str, message: str) -> bool:
-        """Send an encrypted response message to a client."""
+    def send_message(self, client_id: str, message: str, message_type: MessageType = MessageType.DATA) -> bool:
+        """
+        Send a message to a client with specified message type.
+        
+        Args:
+            client_id (str): ID of the client to send message to
+            message (str): Message content to send
+            message_type (MessageType): Type of message (DATA or ERROR), defaults to DATA
+            
+        Returns:
+            bool: True if message sent successfully, False otherwise
+        """
         try:
-            # Check if we've received first message from this client
-            if not self.received_first_message.get(client_id, False):
+            # For DATA messages, verify first message received
+            if message_type == MessageType.DATA and not self.received_first_message.get(client_id, False):
                 log_error(ErrorCode.STATE_ERROR, 
-                         f"Cannot send message to {client_id} before receiving first message")
+                         f"Cannot send DATA message to {client_id} before receiving first message")
                 return False
 
-            # Get client session key
-            session_key = self.key_manager.get_session_key(client_id)
-            if not session_key:
-                log_error(ErrorCode.SECURITY_ERROR, "No session key available")
-                return False
-
-            # Get client socket
+            # Get client socket and session info
             with self.clients_lock:
                 if client_id not in self.clients:
                     log_error(ErrorCode.VALIDATION_ERROR, f"Unknown client ID: {client_id}")
                     return False
                 client_socket = self.clients[client_id]['socket']
 
-            # Encrypt message
-            ciphertext, nonce, tag = Crypto.encrypt(
-                data=message.encode('utf-8'),
-                key=session_key
-            )
+            # For DATA messages, encrypt with session key
+            if message_type == MessageType.DATA:
+                session_key = self.key_manager.get_session_key(client_id)
+                if not session_key:
+                    log_error(ErrorCode.SECURITY_ERROR, "No session key available")
+                    return False
+                    
+                # Encrypt message
+                ciphertext, nonce, tag = Crypto.encrypt(
+                    data=message.encode('utf-8'),
+                    key=session_key
+                )
+                
+                message_data = {
+                    'encryptedMessage': ciphertext.hex(),
+                    'nonce': nonce.hex(),
+                    'tag': tag.hex(),
+                }
+            else:
+                # For ERROR messages, send unencrypted
+                message_data = {
+                    'encryptedMessage': message,
+                    'nonce': self.nonce_manager.generate_nonce(),
+                    'tag': '',
+                }
 
-            # Create message data with type
-            message_type = MessageType.DATA.value
-            message_data = {
-                'encryptedMessage': ciphertext.hex(),
+            # Common message fields
+            message_data.update({
                 'signature': '',
-                'nonce': nonce.hex(),
-                'tag': tag.hex(),
                 'timestamp': int(time.time()),
-                'type': message_type,
+                'type': message_type.value,
                 'sender_id': 'server'
-            }
+            })
 
             # Package and send the message
             response = packageMessage(**message_data)
             sendData(client_socket, response)
-            log_event("Communication", f"Sent message to client {client_id}")
+            log_event("Communication", f"Sent {message_type.name} message to client {client_id}")
 
-            # Only wait for acknowledgment if we're sending a DATA message
-            if message_type == MessageType.DATA.value:
+            # Handle acknowledgment for DATA messages
+            if message_type == MessageType.DATA:
                 try:
                     client_socket.settimeout(5)
                     ack_data = receiveData(client_socket)
@@ -470,7 +499,8 @@ class Server:
                                 nonce=nonce,
                                 tag=tag
                             )
-                            log_event("Communication", f"SERVER RECEIVED ACK from {client_id}: {decrypted_ack.decode('utf-8')}")
+                            log_event("Communication", 
+                                     f"SERVER RECEIVED ACK from {client_id}: {decrypted_ack.decode('utf-8')}")
                 except socket.timeout:
                     log_event("Communication", f"No acknowledgment received from {client_id} within timeout")
                 finally:
@@ -479,7 +509,7 @@ class Server:
             return True
 
         except Exception as e:
-            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send response message: {e}")
+            log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {e}")
             return False
 
     def set_message_handler(self, handler):
@@ -639,10 +669,7 @@ class Server:
                     
         except Exception as e:
             log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key renewal failed: {e}")
-            self._send_error_response(
-                self.clients[client_id]['connection'],
-                "Key renewal failed"
-            )
+            self.send_message(client_id, "Key renewal failed", MessageType.ERROR)
 
     def _receive_renewal_acknowledgment(self, client_id: str, timeout: int = 30) -> Optional[dict]:
         """Wait for and receive key renewal acknowledgment."""
@@ -875,30 +902,35 @@ class Server:
             
             while True:
                 try:
+                    # Check if socket is still valid before receiving
+                    if client_socket.fileno() == -1:
+                        log_event("Connection", f"[HANDLE_MESSAGES] Socket invalid for client {client_id}")
+                        break
+
                     data = receiveData(client_socket)
                     if data is None:  # Connection closed or error
                         log_event("Connection", f"[HANDLE_MESSAGES] Client {client_id} disconnected")
-                        break  # Exit the loop when connection is closed
+                        break
                     
                     # Process the received data
                     self._update_client_activity(client_id)
                     self.process_client_message(data, client_id)
                     
                 except socket.timeout:
-                    continue  # Just continue on timeout
+                    # Don't break on timeout, just continue listening
+                    continue
                 except socket.error as e:
-                    log_error(ErrorCode.NETWORK_ERROR, f"Socket error for client {client_id}: {e}")
-                    break
-                except CommunicationError as e:
-                    log_error(ErrorCode.COMMUNICATION_ERROR, f"Communication error for client {client_id}: {e}")
-                    break
+                    if e.errno in (errno.ECONNRESET, errno.EPIPE, errno.EBADF):
+                        log_error(ErrorCode.NETWORK_ERROR, f"Connection error for client {client_id}: {e}")
+                        break
+                    raise  # Re-raise unexpected socket errors
                 except Exception as e:
                     log_error(ErrorCode.GENERAL_ERROR, f"Error handling message from {client_id}: {e}")
                     break
                 
         finally:
-            # Clean up client connection
-            self._cleanup_client(client_id)  # Use the dedicated cleanup method
+            # Ensure proper cleanup
+            self._cleanup_client(client_id)
 
     def _update_client_activity(self, client_id: str):
         """Update the last activity timestamp for a client."""
@@ -1021,4 +1053,19 @@ class Server:
         """
         with self.clients_lock:
             return list(self.clients.keys())
+
+    def _force_accept_exit(self):
+        """Force the accept loop to exit by connecting to self."""
+        try:
+            if self.server_socket:
+                # Create a temporary socket and connect to self to break accept()
+                tmp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    tmp_socket.connect((self.host, self.port))
+                except:
+                    pass
+                finally:
+                    tmp_socket.close()
+        except:
+            pass
 

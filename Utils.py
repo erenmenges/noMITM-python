@@ -176,6 +176,10 @@ class ErrorCode(Enum):
     KEY_EXCHANGE_ERROR = "KEY_EXCHANGE_ERROR"
     KEY_MANAGEMENT_ERROR = "KEY_MANAGEMENT_ERROR"
     COMMUNICATION_ERROR = "COMMUNICATION_ERROR"
+    ENCRYPTION_ERROR = "ENCRYPTION_ERROR"
+    CLEANUP_ERROR = "CLEANUP_ERROR"
+    CALLBACK_ERROR = "CALLBACK_ERROR"
+    THREAD_ERROR = "THREAD_ERROR"
 
 class ErrorMessage:
     messages = {
@@ -193,7 +197,11 @@ class ErrorMessage:
         ErrorCode.STATE_ERROR: "A state error occurred.",
         ErrorCode.RESOURCE_ERROR: "A resource error occurred.",
         ErrorCode.KEY_MANAGEMENT_ERROR: "A key management error occurred.",
-        ErrorCode.COMMUNICATION_ERROR: "A communication error occurred during message exchange."
+        ErrorCode.COMMUNICATION_ERROR: "A communication error occurred during message exchange.",
+        ErrorCode.ENCRYPTION_ERROR: "An encryption error occurred.",
+        ErrorCode.CLEANUP_ERROR: "A cleanup error occurred.",
+        ErrorCode.CALLBACK_ERROR: "A callback error occurred.",
+        ErrorCode.THREAD_ERROR: "A thread error occurred."
     }
 
 def throw_error(error_code, error_message=None):

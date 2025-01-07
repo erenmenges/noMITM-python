@@ -20,11 +20,40 @@ class TLSConfig:
     cert_path: Optional[Path] = None
     key_path: Optional[Path] = None
     ca_path: Optional[Path] = None
-    verify_mode: str = "NONE"
-    check_hostname: bool = False
-    ciphers: str = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
-    protocols: tuple = field(default_factory=lambda: ("TLSv1.2", "TLSv1.3"))
-    options: Dict[str, Any] = field(default_factory=dict)
+    verify_mode: str = "CERT_REQUIRED"
+    check_hostname: bool = True
+    minimum_version: str = "TLSv1_2"
+    cipher_suites: Optional[List[str]] = None
+    session_tickets: bool = False
+    reuse_sessions: bool = True
+    session_timeout: int = 3600
+    
+    def __init__(self, 
+                 enabled: bool = False,
+                 cert_path: Optional[Path] = None,
+                 key_path: Optional[Path] = None,
+                 ca_path: Optional[Path] = None,
+                 verify_mode: str = "CERT_REQUIRED",
+                 check_hostname: bool = True,
+                 minimum_version: str = "TLSv1_2",
+                 cipher_suites: Optional[List[str]] = None,
+                 session_tickets: bool = False,
+                 reuse_sessions: bool = True,
+                 session_timeout: int = 3600):
+        self.enabled = enabled
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.ca_path = ca_path
+        self.verify_mode = verify_mode
+        self.check_hostname = check_hostname
+        self.minimum_version = minimum_version
+        self.cipher_suites = cipher_suites or [
+            'ECDHE-ECDSA-AES256-GCM-SHA384',
+            'ECDHE-RSA-AES256-GCM-SHA384'
+        ]
+        self.session_tickets = session_tickets
+        self.reuse_sessions = reuse_sessions
+        self.session_timeout = session_timeout
     
     def __post_init__(self):
         """Convert string paths to Path objects if they're strings."""

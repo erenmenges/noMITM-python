@@ -42,16 +42,29 @@ class SecureStorage:
             return self._fernet.decrypt(encrypted)
             
     def remove(self, key: str) -> None:
-        """Securely remove data."""
-        with self._lock:
-            if key in self._storage:
-                # Overwrite with random data before deletion
-                self._storage[key] = os.urandom(len(self._storage[key]))
-                del self._storage[key]
-                
+        """Remove a key with timeout."""
+        try:
+            if self._lock.acquire(timeout=2):  # Add timeout to prevent deadlock
+                try:
+                    if key in self._storage:
+                        del self._storage[key]
+                finally:
+                    self._lock.release()
+        except Exception as e:
+            log_error(ErrorCode.STORAGE_ERROR, f"Error removing key from secure storage: {e}")
+            
     def clear(self) -> None:
-        """Securely clear all stored data."""
-        with self._lock:
-            for key in list(self._storage.keys()):
-                self.remove(key)
-            self._storage.clear() 
+        """Clear all stored data with timeout."""
+        try:
+            if self._lock.acquire(timeout=2):  # Add timeout to prevent deadlock
+                try:
+                    keys = list(self._storage.keys())  # Create a copy of keys
+                    for key in keys:
+                        try:
+                            del self._storage[key]
+                        except KeyError:
+                            pass  # Key might have been removed by another thread
+                finally:
+                    self._lock.release()
+        except Exception as e:
+            log_error(ErrorCode.STORAGE_ERROR, f"Error clearing secure storage: {e}") 

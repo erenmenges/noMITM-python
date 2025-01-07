@@ -167,6 +167,9 @@ class Client:
         if not self.key_manager.has_key_pair():
             self.key_manager.generate_key_pair()
 
+        self._listener_thread = None
+        self._listener_lock = threading.Lock()
+
     def register_error_handler(self, handler):
         """Register callback for error notifications."""
         with self._handler_lock:
@@ -817,7 +820,7 @@ class Client:
                 timestamp=int(time.time()),
                 type=MessageType.SESSION_TERMINATION.value
             )
-            sendData(self.socket, termination_message)  # Add this
+            sendData(self.socket, termination_message)  # Sends termination message
             
             self._update_state({
                 'connection_active': False,
@@ -851,31 +854,117 @@ class Client:
 
     def start_listening(self):
         """Start listening for server messages."""
-        self.listening = True
-        self.listen_thread = threading.Thread(target=self._listen_loop)
-        self.listen_thread.daemon = True
-        self.listen_thread.start()
-        log_event("Communication", "Started listening for server messages")
+        try:
+            with self._listener_lock:
+                if self._listener_thread and self._listener_thread.is_alive():
+                    return  # Already listening
+                
+                self.listening = True  # Set flag before starting thread
+                self._listener_thread = threading.Thread(target=self._listen_for_messages)
+                self._listener_thread.start()
+                
+                # Wait briefly to ensure thread starts
+                time.sleep(0.1)
+                
+                if not self._listener_thread.is_alive():
+                    raise RuntimeError("Listener thread failed to start")
+                    
+                log_event("Communication", "Started listening for server messages")
+                
+        except Exception as e:
+            self.listening = False
+            log_error(ErrorCode.THREAD_ERROR, f"Failed to start listener: {e}")
+            raise
 
     def stop_listening(self):
         """Stop listening for server messages."""
-        self.listening = False
-        if self.listen_thread:
-            self.listen_thread.join(timeout=2)
-        log_event("Communication", "Stopped listening for server messages")
+        try:
+            # First set the flag to stop the listener thread
+            self.listening = False
+            self._connected = False  # Also mark as disconnected
+            
+            # If we have a socket, shut it down properly
+            if hasattr(self, 'socket') and self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except socket.error:
+                    pass  # Socket might already be closed
+                try:
+                    self.socket.close()
+                except socket.error:
+                    pass
+                self.socket = None
+                
+            # Wait for listener thread to finish
+            with self._listener_lock:
+                if self._listener_thread and self._listener_thread.is_alive():
+                    self._listener_thread.join(timeout=2)
+                    if self._listener_thread.is_alive():
+                        log_error(ErrorCode.THREAD_ERROR, "Listener thread failed to stop")
+                    self._listener_thread = None
+                
+            log_event("Communication", "Stopped listening for server messages")
+            
+        except Exception as e:
+            log_error(ErrorCode.THREAD_ERROR, f"Error stopping listener: {e}")
 
-    def _listen_loop(self):
-        """Listen for incoming server messages."""
-        while self.listening and self.is_connected():
-            try:
-                data = receiveData(self.socket)
-                if data:
-                    # Add debug logging
-                    log_event("Communication", f"Received server message: {data}")
+    def _listen_for_messages(self):
+        """Listen for incoming messages from server."""
+        retry_count = 0
+        max_retries = 3
+        retry_delay = 1
+        connection_closed = False
+        
+        try:
+            log_event("Communication", "Started message listener thread")
+            
+            while self.listening and self._connected:
+                try:
+                    if not self.listening or not self._connected:
+                        break
+                        
+                    if not self.socket or self.socket.fileno() == -1:
+                        log_event("Communication", "Socket invalid, stopping listener")
+                        break
+
+                    data = receiveData(self.socket)
+                    if data is None:
+                        if not self.listening:
+                            break
+                        if not connection_closed:  # Only log once
+                            log_event("Communication", "No data received, connection may be closed")
+                            connection_closed = True
+                        if retry_count >= max_retries:
+                            break
+                        retry_count += 1
+                        time.sleep(retry_delay)
+                        continue
+                    
+                    connection_closed = False  # Reset flag on successful receive
+                    retry_count = 0
+                    
                     self.process_server_message(data)
-            except Exception as e:
-                if self.listening:  # Only log if we're still meant to be listening
-                    log_error(ErrorCode.NETWORK_ERROR, f"Error receiving server message: {e}")
+                    self._update_activity_timestamp()
+                    
+                except socket.timeout:
+                    continue
+                except socket.error as e:
+                    if not self.listening:
+                        break
+                    if not connection_closed:  # Only log once
+                        log_error(ErrorCode.NETWORK_ERROR, f"Socket error during receive: {e}")
+                        connection_closed = True
+                    break
+                except Exception as e:
+                    if not self.listening:
+                        break
+                    log_error(ErrorCode.NETWORK_ERROR, f"Error receiving message: {e}")
+                    break
+                    
+        finally:
+            self._connected = False
+            self.listening = False
+            log_event("Communication", "Message listener thread stopped")
 
     def _validate_server_certificate_and_identity(self, hostname: str) -> None:
         """
@@ -1748,110 +1837,145 @@ class Client:
             log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange response handling failed: {e}")
             return False
 
-    def cleanup(self):
-        """Clean up client resources."""
+    def _cleanup_base(self):
+        """Base cleanup for socket and resources."""
         try:
+            log_event("Cleanup", "[CLEANUP] Starting base cleanup")
+            
+            # Close socket if it exists
             if hasattr(self, 'socket') and self.socket:
                 try:
-                    self.socket.shutdown(socket.SHUT_RDWR)
-                except:
-                    pass
-                try:
-                    self.socket.close()
+                    if self.socket.fileno() != -1:
+                        try:
+                            self.socket.shutdown(socket.SHUT_RDWR)
+                        except:
+                            pass
+                        self.socket.close()
                 except:
                     pass
                 self.socket = None
                 
-            log_event("Client", "Cleanup completed successfully")
+            # Clean up resources
+            with self._resource_lock:
+                # Clean up buffers
+                for buffer in list(self._resources['buffers']):
+                    self._release_resource('buffer', buffer)
+                    
+                # Clean up temporary files
+                for file_path in list(self._resources['temp_files']):
+                    self._release_resource('temp_file', file_path)
+                    
+                # Clean up key material
+                for key_material in list(self._resources['key_material']):
+                    self._release_resource('key_material', key_material)
+                    
+                # Reset socket resource
+                self._resources['socket'] = None
+                
+            log_event("Cleanup", "[CLEANUP] Base cleanup completed")
+            
         except Exception as e:
-            log_error(ErrorCode.CLEANUP_ERROR, f"Error during cleanup: {e}")
+            log_error(ErrorCode.CLEANUP_ERROR, f"Base cleanup failed: {e}")
+
+    def _cleanup_session(self):
+        """Clean up session resources."""
+        try:
+            # Stop listening first
+            self.stop_listening()
+            
+            # Clear secure storage with timeout
+            try:
+                if hasattr(self, '_secure_storage'):
+                    self._secure_storage.clear()
+            except Exception as e:
+                log_error(ErrorCode.CLEANUP_ERROR, f"Error clearing secure storage: {e}")
+            
+            # Reset session state
+            try:
+                self._reset_session_state()
+            except Exception as e:
+                log_error(ErrorCode.CLEANUP_ERROR, f"Error resetting session state: {e}")
+            
+        except Exception as e:
+            log_error(ErrorCode.CLEANUP_ERROR, f"Error during session cleanup: {e}")
 
     def shutdown(self):
-        """Graceful shutdown with proper cleanup."""
+        """Shutdown the client and cleanup all resources."""
         try:
-            # Set flags first to stop threads
-            self.running = False
-            self._connected = False
-            self.listening = False
+            log_event("Cleanup", "[CLEANUP] Starting full shutdown")
             
-            # Send termination message if still connected
-            if self.socket and self.socket.fileno() != -1:
-                try:
-                    termination_message = packageMessage(
-                        encryptedMessage='',
-                        signature='',
-                        nonce=self.nonce_manager.generate_nonce(),
-                        timestamp=int(time.time()),
-                        type=MessageType.SESSION_TERMINATION.value
-                    )
-                    sendData(self.socket, termination_message)
-                except:
-                    pass
+            # Set shutdown flag
+            self._shutting_down = True
             
-            # Wait for threads to finish
-            if hasattr(self, '_heartbeat_thread') and self._heartbeat_thread:
-                self._heartbeat_thread.join(timeout=2)
-            if hasattr(self, 'listen_thread') and self.listen_thread:
-                self.listen_thread.join(timeout=2)
+            # Cleanup session first
+            try:
+                self._cleanup_session()
+            except Exception as e:
+                log_error(ErrorCode.CLEANUP_ERROR, f"Session cleanup failed: {e}")
             
-            # Then cleanup resources
-            self.terminate_session()
+            # Base cleanup - only call once
+            try:
+                self._cleanup_base()
+            except Exception as e:
+                log_error(ErrorCode.CLEANUP_ERROR, f"Base cleanup failed: {e}")
             
         except Exception as e:
-            log_error(ErrorCode.CLEANUP_ERROR, f"Error during shutdown: {e}")
-
-    def _attempt_reconnection(self) -> bool:
-        """Attempt to reconnect to the server."""
-        try:
-            for attempt in range(self.max_retries):
-                log_event("Connection", f"Reconnection attempt {attempt + 1}/{self.max_retries}")
-                try:
-                    # Create new socket
-                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.socket.settimeout(self._connection_timeout)
-                    self.socket.connect(self.destination)
-                    
-                    # Re-establish secure session
-                    if self._establish_secure_session():
-                        return True
-                    
-                except Exception as e:
-                    log_error(ErrorCode.NETWORK_ERROR, f"Reconnection attempt failed: {e}")
-                    time.sleep(self.retry_delay * (attempt + 1))
-                
-            return False
-            
-        except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Reconnection failed: {e}")
-            return False
+            log_error(ErrorCode.SHUTDOWN_ERROR, f"Error during shutdown: {e}")
 
     def _handle_connection_failure(self):
-        """Handle connection failures gracefully."""
+        """Handle connection failures with cleanup and recovery."""
         try:
+            log_event("Connection", "[CONNECTION] Handling connection failure")
+            
+            # Perform session cleanup
+            self._cleanup_session()
+            
+            # Attempt reconnection if configured
+            if hasattr(self, 'max_retries') and self.max_retries > 0:
+                if self._attempt_reconnection():
+                    log_event("Connection", "[CONNECTION] Reconnection successful")
+                    return
+                
+            log_event("Connection", "[CONNECTION] Connection failure handled")
+            
+        except Exception as e:
+            log_error(ErrorCode.CONNECTION_ERROR, f"Connection failure handling failed: {e}")
+
+    def _reset_session_state(self):
+        """Reset all session-related state."""
+        try:
+            # Update connection state
             with self._state_lock:
                 self._connected = False
-                self._update_state({
+                state_updates = {
                     'connection_active': False,
                     'session_established': False,
                     'key_exchange_complete': False,
-                    'last_activity': time.time()  # Update last activity
-                })
+                    'last_activity': time.time()
+                }
+                self._update_state(state_updates)
+                log_event("State", f"Reset session state: {list(state_updates.keys())}")
                 
-                # Try to close socket gracefully
-                if self.socket:
-                    try:
-                        self.socket.shutdown(socket.SHUT_RDWR)
-                    except:
-                        pass
-                    try:
-                        self.socket.close()
-                    except:
-                        pass
-                    self.socket = None
-                
-                # Notify about connection failure
-                self._notify_state_change(False)
-                
+            # Reset managers
+            try:
+                if hasattr(self, 'key_manager'):
+                    if hasattr(self, '_secure_storage'):
+                        keys_to_remove = [k for k in self._secure_storage._storage.keys() 
+                                        if k.startswith('session_key_')]
+                        for key in keys_to_remove:
+                            self._secure_storage.remove(key)
+                            
+                if hasattr(self, 'sequence_manager'):
+                    self.sequence_manager.reset()
+                if hasattr(self, 'nonce_manager'):
+                    self.nonce_manager.cleanup_old_nonces()
+                log_event("State", "Reset all managers")
+            except Exception as e:
+                log_error(ErrorCode.CLEANUP_ERROR, f"Manager cleanup failed: {e}")
+            
+            # Notify about state change
+            self._notify_state_change(False)
+            
         except Exception as e:
-            log_error(ErrorCode.CONNECTION_ERROR, f"Error handling connection failure: {e}")
+            log_error(ErrorCode.CLEANUP_ERROR, f"Failed to reset session state: {e}")
 
