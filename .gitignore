@@ -1,0 +1,9 @@
+# Test certificates and keys
+test_certs/
+tests/
+
+# Log files
+logs/
+
+# Ignore all .log files anywhere
+*.log 
