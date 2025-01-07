@@ -25,64 +25,6 @@ Detailed Logging
 Resource Management and Cleanup
 Secure Memory Clearance
 
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-- OpenSSL 1.1.1 or higher
-
-### Step-by-Step Installation
-
-1. **Clone the Repository**
-
-   ```bash
-   git clone https://github.com/yourusername/secure-communication-system.git
-   cd secure-communication-system
-   ```
-
-2. **Create and Activate Virtual Environment** (Recommended)
-
-   ```bash
-   # On Windows
-   python -m venv venv
-   .\venv\Scripts\activate
-
-   # On Unix/MacOS
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-3. **Install Required Dependencies**
-
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-
-4. **Generate Test Certificates** (Required for TLS-mode)
-
-   ```bash
-   python scripts/generate_test_certs.py
-   ```
-
-   This will create necessary certificates in the `test_certs` directory:
-   - `ca.crt` - Certificate Authority certificate
-   - `server.crt` and `server.key` - Server certificate and private key
-   - `client.crt` and `client.key` - Client certificate and private key
-
-5. **Configure TLS Settings** (Optional)
-   - Copy `config/tls_config.example.json` to `config/tls_config.json`
-   - Modify the paths to match your certificate locations
-
-   ```json
-   {
-     "enabled": true,
-     "cert_path": "path/to/cert.crt",
-     "key_path": "path/to/key.pem",
-     "ca_path": "path/to/ca.crt"
-   }
-   ```
-
 ## Purpose
 
 This project implements a robust and secure client-server communication system designed for applications requiring high-security standards and reliable data exchange. The system prioritizes security, scalability, and reliability through several key architectural decisions:
@@ -284,3 +226,64 @@ is_connected() -> bool: Checks if client has active connection
 register_error_handler(handler): Registers callback for error notifications
 
 register_state_change_handler(handler): Registers callback for connection state changes.
+
+
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8 or higher
+- OpenSSL 1.1.1 or higher
+
+### Step-by-Step Installation
+
+1. **Clone the Repository**
+
+   ```bash
+   git clone https://github.com/yourusername/secure-communication-system.git
+   cd secure-communication-system
+   ```
+
+2. **Create and Activate Virtual Environment** (Recommended)
+
+   ```bash
+   # On Windows
+   python -m venv venv
+   .\venv\Scripts\activate
+
+   # On Unix/MacOS
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+3. **Install Required Dependencies**
+
+   ```bash
+   pip3 install -r requirements.txt
+   ```
+
+4. **Generate Test Certificates** (Required for TLS-mode)
+
+   ```bash
+   python scripts/generate_test_certs.py
+   ```
+
+   This will create necessary certificates in the `test_certs` directory:
+   - `ca.crt` - Certificate Authority certificate
+   - `server.crt` and `server.key` - Server certificate and private key
+   - `client.crt` and `client.key` - Client certificate and private key
+
+5. **Configure TLS Settings** (Optional)
+   - Copy `config/tls_config.example.json` to `config/tls_config.json`
+   - Modify the paths to match your certificate locations
+
+   ```json
+   {
+     "enabled": true,
+     "cert_path": "path/to/cert.crt",
+     "key_path": "path/to/key.pem",
+     "ca_path": "path/to/ca.crt"
+   }
+   ```
+   
