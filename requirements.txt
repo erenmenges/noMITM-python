@@ -1,0 +1,18 @@
+# Core cryptographic dependencies
+cryptography>=41.0.0
+pyOpenSSL>=23.0.0
+cffi>=1.15.1
+
+# Testing and development
+pytest>=7.4.0
+pytest-cov>=4.1.0
+coverage>=7.2.7
+
+# Type checking
+mypy>=1.4.1
+typing-extensions>=4.7.1
+
+# Code quality
+black>=23.7.0
+flake8>=6.1.0
+isort>=5.12.0 
