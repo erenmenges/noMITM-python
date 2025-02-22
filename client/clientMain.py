@@ -462,8 +462,7 @@ class Client:
                 # Store session key using server-assigned client ID
                 self.key_manager.store_session_key(self.client_id, session_key)
                 log_event("Security", "[SECURE_SESSION] Session key stored successfully")
-                # Add debug log for session key
-                log_event("Security", f"[DEBUG] Client session key (hex): {session_key.hex()}")
+                
                 
                 # Start monitoring
                 log_event("Connection", "[SECURE_SESSION] Starting connection monitoring threads")
