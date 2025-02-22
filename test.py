@@ -35,7 +35,7 @@ try:
     denemeclient.tls_config = client_tls_config
 
     denemeserver = server.serverMain.Server("127.0.0.1", 12345, tls_config=server_tls_config)
-    denemeserver.set_message_handler(server_message_handler)
+    denemeserver.message_handler = server_message_handler
 
     logging.info("Starting server...")
     denemeserver.start()
@@ -60,7 +60,7 @@ try:
     time.sleep(0.1)  # Wait for server response
     
     # Send server response
-    client_ids = denemeserver.get_client_ids()
+    client_ids = list(denemeserver.clients.keys())
     if not client_ids:
         raise RuntimeError("No connected clients found")
         
@@ -81,6 +81,7 @@ finally:
         # Now we can shutdown
         if denemeclient:
             denemeclient.shutdown()
+            time.sleep(1)
         if denemeserver:
             denemeserver.shutdown()
     except Exception as e:

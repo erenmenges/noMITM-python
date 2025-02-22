@@ -68,6 +68,7 @@ class Server:
         self._lock = threading.Lock()
         self.clients_lock = threading.Lock()
         self.clients: Dict[str, dict] = {}
+        self._client_threads = []
         self.running = False
         self.server_socket = None
         
@@ -163,8 +164,8 @@ class Server:
                         target=self._handle_client,
                         args=(client_socket, client_address)
                     )
-                    client_thread.daemon = True
                     client_thread.start()
+                    self._client_threads.append(client_thread)
                     
                 except socket.error:
                     if not self.running:
@@ -177,18 +178,6 @@ class Server:
             if self.running:
                 log_error(ErrorCode.GENERAL_ERROR, f"Error in accept loop: {e}")
 
-    def cleanup_inactive_clients(self):
-        """Remove inactive client connections."""
-        current_time = time.time()
-        inactive_clients = []
-        
-        with self.clients_lock:  # Add thread safety
-            for client_id, client_data in self.clients.items():
-                if current_time - client_data['last_activity'] > self.connection_timeout:
-                    inactive_clients.append(client_id)
-                    
-            for client_id in inactive_clients:
-                self.close_client_connection(client_id)
 
     def close_client_connection(self, client_id: str):
         """Safely close client connection with proper key cleanup."""
@@ -202,7 +191,7 @@ class Server:
             # Proceed with normal cleanup
             try:
                 client_data = self.clients[client_id]
-                conn = client_data['connection']
+                conn = client_data['socket']
                 
                 # Send termination message and close connection
                 try:
@@ -258,13 +247,18 @@ class Server:
                 except socket.error:
                     pass
             
-            # Wait for accept thread to finish
-            if hasattr(self, '_accept_thread') and self._accept_thread.is_alive():
-                self._accept_thread.join(timeout=2)
+            # Wait for accept thread to finish (reduced timeout)
+            if hasattr(self, '_accept_thread') and self._accept_thread and self._accept_thread.is_alive():
+                self._accept_thread.join(timeout=0.5)  # Reduced timeout from 2 to 0.5 seconds
             
             # Stop cleanup thread if exists
             if hasattr(self, 'key_manager'):
                 self.key_manager.stop_cleanup_thread()
+            
+            # Join all client handler threads (reduced timeout)
+            for thread in self._client_threads:
+                if thread.is_alive():
+                    thread.join(timeout=0.5)  # Reduced timeout from 2 to 0.5 seconds
             
             log_event("Server", "Server shutdown completed")
             
@@ -380,8 +374,6 @@ class Server:
             
             # Store the session key for this client
             self.key_manager.store_session_key(client_id, shared_key)
-            # Add debug log for session key
-            log_event("Security", f"[DEBUG] Server session key for {client_id} (hex): {shared_key.hex()}")
             
             # Create response with server's public key and assigned client_id
             response = {
@@ -400,20 +392,6 @@ class Server:
             log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange failed: {e}")
             self.send_message(client_id, "Key exchange failed", MessageType.ERROR)
             raise
-
-    def _send_error_response(self, conn: socket.socket, error_message: str):
-        """Send error response to client."""
-        try:
-            error_response = packageMessage(
-                encryptedMessage=error_message,
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=int(time.time()),
-                type=MessageType.ERROR.value
-            )
-            sendData(conn, error_response)
-        except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Failed to send error response: {e}")
 
     def send_message(self, client_id: str, message: str, message_type: MessageType = MessageType.DATA) -> bool:
         """
@@ -512,300 +490,6 @@ class Server:
             log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {e}")
             return False
 
-    def set_message_handler(self, handler):
-        """
-        Set the message handler callback function.
-        
-        Args:
-            handler: Callable that takes a message string as argument
-        """
-        if not callable(handler):
-            raise ValueError("Message handler must be callable")
-        with self._lock:
-            self.message_handler = handler
-
-    def _validate_message_sequence(self, message: dict, client_id: str) -> bool:
-        """
-        Validate both sequence number and nonce for comprehensive replay protection.
-        
-        Args:
-            message (dict): The parsed message
-            client_id (str): The client ID
-        
-        Returns:
-            bool: True if validation passes, False otherwise
-        """
-        try:
-            # Validate sequence number for message ordering
-            sequence = message.get('sequence')
-            sender_id = message.get('sender_id', client_id)
-            if not self.sequence_manager.validate_sequence(sequence, sender_id):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message sequence")
-                return False
-
-            # Validate nonce for replay protection
-            nonce = message.get('nonce')
-            if not self.nonce_manager.validate_nonce(nonce):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid or reused nonce")
-                return False
-
-            return True
-        except Exception as e:
-            log_error(ErrorCode.VALIDATION_ERROR, f"Message validation failed: {e}")
-            return False
-
-    def _verify_message_signature(self, message: dict, client_id: str) -> bool:
-        """
-        Verify message signature covering all critical fields.
-        
-        Args:
-            message (dict): The message to verify
-            client_id (str): The client ID
-        
-        Returns:
-            bool: True if signature is valid
-        """
-        try:
-            # Create signature payload including all critical fields
-            signature_payload = {
-                'encryptedMessage': message['encryptedMessage'],
-                'nonce': message['nonce'],
-                'timestamp': message['timestamp'],
-                'type': message['type'],
-                'sequence': message['sequence'],
-                'sender_id': message.get('sender_id', client_id),
-                'iv': message.get('iv', ''),
-                'tag': message.get('tag', '')
-            }
-            
-            signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
-            signature = message.get('signature')
-            
-            with self.clients_lock:
-                if client_id not in self.clients:
-                    return False
-                client_public_key = self.clients[client_id].get('public_key')
-                
-            if not client_public_key:
-                log_error(ErrorCode.SECURITY_ERROR, "No public key available for signature verification")
-                return False
-                
-            return self.key_manager.verify_signature(
-                client_public_key,
-                signature_bytes,
-                bytes.fromhex(signature)
-            )
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"Signature verification failed: {e}")
-            return False
-
-    def handle_key_renewal_request(self, client_id: str, message: dict):
-        """Handle key renewal request with verification."""
-        try:
-            # Verify the current request
-            if not self._verify_message_signature(message, client_id):
-                raise ValueError("Invalid signature on key renewal request")
-
-            new_public_key = message.get('newPublicKey')
-            if not new_public_key:
-                raise ValueError("Missing new public key in renewal request")
-            
-            # Generate new server key pair
-            server_public_pem, server_private_pem = Crypto.generate_key_pair()
-            
-            # Update client's session data atomically
-            with self.clients_lock:
-                if client_id not in self.clients:
-                    raise ValueError("Client not found")
-                    
-                client_data = self.clients[client_id]
-                old_public_key = client_data.get('public_key')
-                old_session_key = client_data.get('session_key')
-                
-                try:
-                    # Update client's public key
-                    client_data['public_key'] = serialization.load_pem_public_key(
-                        new_public_key.encode(),
-                        backend=default_backend()
-                    )
-                    
-                    # Derive new session key
-                    new_session_key = Crypto.derive_session_key(
-                        client_data['public_key'],
-                        server_private_pem,
-                        b"key renewal"
-                    )
-                    
-                    # Send response with server's new public key
-                    response = packageMessage(
-                        encryptedMessage=server_public_pem.decode(),
-                        signature='',
-                        nonce=self.nonce_manager.generate_nonce(),
-                        timestamp=int(time.time()),
-                        type=MessageType.KEY_RENEWAL_RESPONSE.value
-                    )
-                    sendData(client_data['connection'], response)
-                    
-                    # Wait for client acknowledgment
-                    ack_data = self._receive_renewal_acknowledgment(client_id)
-                    if not ack_data:
-                        raise ValueError("Client failed to acknowledge key renewal")
-                    
-                    # Verify acknowledgment with new key
-                    if not self._verify_renewal_acknowledgment(ack_data, client_data['public_key']):
-                        raise ValueError("Invalid key renewal acknowledgment")
-                    
-                    # Update session key after successful verification
-                    client_data['session_key'] = new_session_key
-                    self.key_manager.update_client_key(client_id, server_private_pem)
-                    
-                    log_event("Key Renewal", f"Completed key renewal for client {client_id}")
-                    
-                except Exception as e:
-                    # Rollback on failure
-                    client_data['public_key'] = old_public_key
-                    client_data['session_key'] = old_session_key
-                    raise
-                    
-        except Exception as e:
-            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key renewal failed: {e}")
-            self.send_message(client_id, "Key renewal failed", MessageType.ERROR)
-
-    def _receive_renewal_acknowledgment(self, client_id: str, timeout: int = 30) -> Optional[dict]:
-        """Wait for and receive key renewal acknowledgment."""
-        try:
-            with self.clients_lock:
-                if client_id not in self.clients:
-                    return None
-                conn = self.clients[client_id]['connection']
-            
-            conn.settimeout(timeout)
-            try:
-                ack_data = receiveData(conn)
-                if not ack_data:
-                    return None
-                
-                parsed_ack = parseMessage(ack_data)
-                if parsed_ack.get('type') != MessageType.KEY_RENEWAL_RESPONSE.value:
-                    return None
-                    
-                return parsed_ack
-                
-            finally:
-                conn.settimeout(self.connection_timeout)
-                
-        except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Failed to receive renewal acknowledgment: {e}")
-            return None
-
-    def _verify_renewal_acknowledgment(self, ack_data: dict, public_key) -> bool:
-        """Verify the key renewal acknowledgment."""
-        try:
-            if not ack_data.get('signature'):
-                return False
-                
-            signature_payload = {
-                'type': ack_data['type'],
-                'nonce': ack_data['nonce'],
-                'timestamp': ack_data['timestamp']
-            }
-            
-            signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
-            return self.key_manager.verify_signature(
-                public_key,
-                signature_bytes,
-                bytes.fromhex(ack_data['signature'])
-            )
-            
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"Failed to verify renewal acknowledgment: {e}")
-            return False
-
-    def is_connected(self, client_id: str) -> bool:
-        """
-        Check if a client is currently connected and has an active session.
-        
-        Args:
-            client_id (str): The client ID to check
-            
-        Returns:
-            bool: True if client is connected with active session
-        """
-        with self.clients_lock:
-            if client_id not in self.clients:
-                return False
-            client_data = self.clients[client_id]
-            return (
-                client_data.get('connection') is not None and
-                client_data.get('session_key') is not None and
-                client_data.get('last_activity', 0) > time.time() - self.connection_timeout
-            )
-
-    def _handle_encryption_failure(self, client_id: str):
-        """Handle encryption failures with proper key management."""
-        try:
-            with self.clients_lock:
-                key_data = self._secure_storage.retrieve(f'session_key_{client_id}')
-                if not key_data:
-                    self.close_client_connection(client_id)
-                    return
-
-                # Update failure count
-                key_data['encryption_failures'] += 1
-                self._secure_storage.store(f'session_key_{client_id}', key_data)
-
-                if key_data['encryption_failures'] >= self.max_encryption_failures:
-                    log_error(ErrorCode.SECURITY_ERROR, 
-                             f"Too many encryption failures for client {client_id}")
-                    self.close_client_connection(client_id)
-                    raise SecurityError("Maximum encryption failures exceeded")
-                else:
-                    self._initiate_key_renewal(client_id)
-
-        except Exception as e:
-            log_error(ErrorCode.GENERAL_ERROR, f"Error handling encryption failure: {e}")
-            self.close_client_connection(client_id)
-            raise
-
-    def _handle_key_renewal_response(self, client_id: str, message: dict):
-        """Handle client's response to key renewal request."""
-        try:
-            with self.clients_lock:
-                if client_id not in self.clients:
-                    return
-                client_data = self.clients[client_id]
-                
-                # Verify the response signature
-                if not self._verify_message_signature(message, client_id):
-                    raise ValueError("Invalid signature on key renewal response")
-                    
-                # Process the new key material
-                new_public_key = message.get('encryptedMessage')
-                if not new_public_key:
-                    raise ValueError("Missing new public key in renewal response")
-                    
-                # Update client's public key
-                client_data['public_key'] = serialization.load_pem_public_key(
-                    new_public_key.encode(),
-                    backend=default_backend()
-                )
-                
-                # Generate new session key
-                new_session_key = Crypto.derive_session_key(
-                    client_data['public_key'],
-                    self.private_key,
-                    b"key renewal"
-                )
-                
-                # Update session key
-                client_data['session_key'] = new_session_key
-                
-                log_event("Key Renewal", f"Completed key renewal for client {client_id}")
-                
-        except Exception as e:
-            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Key renewal response handling failed: {e}")
-            self.close_client_connection(client_id)
-
     def _handle_client(self, client_socket: socket.socket, address: Tuple[str, int]):
         """Handle new client connection with certificate validation and message handling."""
         try:
@@ -817,34 +501,23 @@ class Server:
             if self.tls_config and self.tls_config.enabled:
                 log_event("Security", f"[HANDLE_CLIENT] TLS enabled, wrapping socket for {address}")
                 try:
-                    # Create TLS context
-                    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    
-                    # Configure TLS settings
-                    context.minimum_version = ssl.TLSVersion.TLSv1_2  # Explicitly sets minimum to TLS 1.2
-                    context.load_cert_chain(
-                        certfile=str(self.tls_config.cert_path),
-                        keyfile=str(self.tls_config.key_path)
-                    )
-                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
-                    
-                    if self.tls_config.verify_mode == "CERT_REQUIRED":
-                        context.verify_mode = ssl.CERT_REQUIRED
-                    
-                    # Wrap socket
-                    client_socket = context.wrap_socket(
+                    # Use our TLSWrapper so that the TLS configuration and handshake
+                    # are applied symmetrically on both client and server.
+                    from security.TLSWrapper import TLSWrapper
+                    tls_wrapper = TLSWrapper(self.tls_config, client_mode=False)
+                    client_socket = tls_wrapper.wrap_socket(
                         client_socket,
                         server_side=True,
                         do_handshake_on_connect=True
                     )
                     
-                    # Now we can validate the certificate
+                    # If client certificates must be verified, check that the peer certificate is supplied.
                     if self.tls_config.verify_mode == "CERT_REQUIRED":
                         client_cert = client_socket.getpeercert()
                         if not client_cert:
                             raise ValueError("No client certificate provided")
                         log_event("Security", f"[HANDLE_CLIENT] Certificate validated for {address}")
-                        
+                    
                 except Exception as e:
                     log_error(ErrorCode.AUTHENTICATION_ERROR, f"TLS setup failed: {e}")
                     client_socket.close()
@@ -937,13 +610,16 @@ class Server:
         """Update the last activity timestamp for a client."""
         try:
             with self.clients_lock:
-                        if client_id in self.clients:
-                            self.clients[client_id]['last_activity'] = time.time()
-                            self.clients[client_id]['messages_received'] += 1
-                            log_event("Connection", 
-                                     f"[HANDLE_CLIENT] Updated activity for {client_id}: "
-                        f"Delta = {time.time() - self.clients[client_id]['last_activity']:.2f}s, "
-                                     f"Total messages = {self.clients[client_id]['messages_received']}")
+                if client_id in self.clients:
+                    prev_time = self.clients[client_id]['last_activity']
+                    current_time = time.time()
+                    self.clients[client_id]['last_activity'] = current_time
+                    self.clients[client_id]['messages_received'] += 1
+                    delta = current_time - prev_time
+                    log_event("Connection", 
+                            f"[HANDLE_CLIENT] Updated activity for {client_id}: "
+                            f"Delta = {delta:.2f}s, "
+                            f"Total messages = {self.clients[client_id]['messages_received']}")
         except Exception as e:
             log_error(ErrorCode.STATE_ERROR, f"Failed to update client activity: {e}")
 
@@ -979,37 +655,6 @@ class Server:
         except Exception as e:
             log_error(ErrorCode.CLEANUP_ERROR, f"Error cleaning up client {client_id}: {e}")
 
-    def _validate_client_certificate(self, client_socket: socket.socket) -> Optional[x509.Certificate]:
-        """Validate client certificate and perform security checks."""
-        try:
-            cert_binary = client_socket.getpeercert(binary_form=True)
-            if not cert_binary:
-                raise ValueError("No client certificate provided")
-            
-            client_cert = x509.load_der_x509_certificate(cert_binary, default_backend())
-            
-            # Verify certificate chain
-            if not self.key_manager.verify_certificate(client_cert, self.ca_certificate):
-                raise ValueError("Client certificate verification failed")
-            
-            # Check certificate revocation if enabled
-            if self.tls_config.check_ocsp:
-                if not self.key_manager.check_certificate_revocation(client_cert, self.ca_certificate):
-                    raise ValueError("Client certificate has been revoked")
-            
-            # Validate allowed subjects if configured
-            if self.tls_config.cert_config.allowed_subjects:
-                subject = client_cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-                if subject not in self.tls_config.cert_config.allowed_subjects:
-                    raise ValueError(f"Client subject {subject} not in allowed subjects list")
-            
-            log_event("Security", f"Client certificate validated successfully")
-            return client_cert
-
-        except Exception as e:
-            log_error(ErrorCode.AUTHENTICATION_ERROR, f"Client certificate validation failed: {e}")
-            return None
-
     def _process_secure_message(self, message_data: dict, client_id: str) -> Optional[str]:
         """Process an encrypted message."""
         try:
@@ -1044,16 +689,6 @@ class Server:
         except Exception as e:
             log_error(ErrorCode.CRYPTO_ERROR, f"Failed to process secure message: {e}")
             raise
-
-    def get_client_ids(self) -> list:
-        """
-        Get a list of all connected client IDs.
-        
-        Returns:
-            list: List of client IDs currently connected to the server
-        """
-        with self.clients_lock:
-            return list(self.clients.keys())
 
     def _force_accept_exit(self):
         """Force the accept loop to exit by connecting to self."""

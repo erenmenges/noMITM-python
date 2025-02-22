@@ -47,16 +47,6 @@ from Utils import (
 from security.TLSWrapper import TLSWrapper, TLSConfig
 from security.secure_storage import SecureStorage
 
-@contextmanager
-def socket_timeout_context(sock, timeout):
-    """Context manager for socket timeout operations."""
-    original_timeout = sock.gettimeout()
-    try:
-        sock.settimeout(timeout)
-        yield
-    finally:
-        sock.settimeout(original_timeout)
-
 class Client:
     """
     Secure client implementation for encrypted communication.
@@ -161,7 +151,7 @@ class Client:
             'key_material': set(),
             'buffers': []
         }
-        self._resource_lock = threading.Lock()
+        self._resource_lock = threading.RLock()
         
         # Generate keys if needed
         if not self.key_manager.has_key_pair():
@@ -169,25 +159,9 @@ class Client:
 
         self._listener_thread = None
         self._listener_lock = threading.Lock()
-
-    def register_error_handler(self, handler):
-        """Register callback for error notifications."""
-        with self._handler_lock:
-            self._error_handlers.append(handler)
-            
-    def register_state_change_handler(self, handler):
-        """Register callback for connection state changes."""
-        with self._handler_lock:
-            self._state_change_handlers.append(handler)
-            
-    def _notify_error(self, error_code: ErrorCode, error_message: str):
-        """Notify all registered error handlers."""
-        with self._handler_lock:
-            for handler in self._error_handlers:
-                try:
-                    handler(error_code, error_message)
-                except Exception as e:
-                    log_error(ErrorCode.CALLBACK_ERROR, f"Error handler failed: {e}")
+        
+        self._shutting_down = False  # Initialize shutdown flag to control the listener thread
+        
 
     def _notify_state_change(self, new_state: bool):
         """Notify all registered state change handlers."""
@@ -198,21 +172,6 @@ class Client:
                 except Exception as e:
                     log_error(ErrorCode.CALLBACK_ERROR, f"State change handler failed: {e}")
 
-    def set_session_key(self, key: bytes):
-        """Store the session key securely."""
-        try:
-            log_event("Security", "[SECURE_SESSION] Storing session key")
-            with self._storage_lock:
-                # Convert the data to bytes using JSON
-                key_data = json.dumps({
-                    'key': key.hex(),  # Convert bytes to hex string
-                    'timestamp': int(time.time())
-                }).encode('utf-8')
-                self._secure_storage.store('session_key', key_data)
-            log_event("Security", "[SECURE_SESSION] Session key stored successfully")
-        except Exception as e:
-            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"[SECURE_SESSION] Failed to store session key: {str(e)}")
-            raise
 
     def get_session_key(self) -> Optional[bytes]:
         """Retrieve the session key."""
@@ -257,59 +216,6 @@ class Client:
             except Exception:
                 return False
 
-    def _perform_with_timeout(self, operation, timeout_key, *args, **kwargs):
-        """Execute operation with timeout and retry logic."""
-        timeout = self._operation_timeouts.get(timeout_key, 30)
-        retries = 0
-        last_error = None
-        
-        while retries < self._retry_config['max_retries']:
-            try:
-                with socket_timeout_context(self.socket, timeout):
-                    return operation(*args, **kwargs)
-            except socket.timeout:
-                delay = min(
-                    self._retry_config['backoff_factor'] * (2 ** retries),
-                    self._retry_config['max_delay']
-                )
-                log_error(
-                    ErrorCode.TIMEOUT_ERROR,
-                    f"{timeout_key} operation timed out, retrying in {delay}s"
-                )
-                time.sleep(delay)
-                retries += 1
-                last_error = f"{timeout_key} operation timed out"
-            except Exception as e:
-                log_error(ErrorCode.GENERAL_ERROR, f"{timeout_key} operation failed: {e}")
-                raise
-        
-        raise TimeoutError(f"Operation failed after {retries} retries: {last_error}")
-
-    def _connect_to_server(self, destination: Tuple[str, int]):
-        """Establish initial TCP connection to server."""
-        try:
-            log_event("Connection", f"Attempting to connect to {destination[0]}:{destination[1]}")
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(self._operation_timeouts['connect'])  # Set timeout directly
-            self.socket.connect(destination)
-            log_event("Connection", "TCP connection established successfully")
-            return True
-        except Exception as e:
-            log_error(ErrorCode.CONNECTION_ERROR, f"Failed to connect to server: {e}")
-            return False
-
-    def _perform_key_exchange(self):
-        """Perform basic key exchange for non-TLS connections."""
-        try:
-            log_event("Session", "Performing basic key exchange")
-            # For non-TLS connections, we'll use a simplified session key
-            session_key = os.urandom(32)  # Generate a 256-bit session key
-            self.key_manager.set_session_key('default', session_key)
-            return True
-        except Exception as e:
-            log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange failed: {e}")
-            return False
-
     def establish_secure_session(self, destination: Tuple[str, int]) -> bool:
         """Establish a secure session with the server."""
         try:
@@ -340,27 +246,19 @@ class Client:
                 
                 # Wrap socket with TLS if enabled
                 if self.tls_config and self.tls_config.enabled:
-                    log_event("Security", "[SECURE_SESSION] Wrapping socket with TLS")
-                    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-                    
-                    # Load certificates
-                    context.load_cert_chain(
-                        certfile=str(self.tls_config.cert_path),
-                        keyfile=str(self.tls_config.key_path)
-                    )
-                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
-                    
-                    if self.tls_config.verify_mode == "CERT_REQUIRED":
-                        context.verify_mode = ssl.CERT_REQUIRED
-                        context.check_hostname = True
-                    
-                    # Wrap the socket
-                    self.socket = context.wrap_socket(
-                        self.socket,
-                        server_hostname=destination[0]
-                    )
-                    log_event("Security", "[SECURE_SESSION] TLS handshake completed")
-                
+                    log_event("Security", "[SECURE_SESSION] Wrapping socket with TLS using TLSWrapper")
+                    try:
+                        tls_wrapper = TLSWrapper(self.tls_config, client_mode=True)
+                        self.socket = tls_wrapper.wrap_socket(
+                            self.socket,
+                            server_side=False,
+                            server_hostname=destination[0]
+                        )
+                        log_event("Security", "[SECURE_SESSION] TLS handshake completed using TLSWrapper")
+                    except Exception as e:
+                        log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] TLS wrapping failed: {str(e)}")
+                        raise
+            
             except Exception as e:
                 log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] Failed to create/connect socket: {str(e)}")
                 log_error(ErrorCode.NETWORK_ERROR, f"[SECURE_SESSION] Exception type: {type(e)}")
@@ -503,48 +401,6 @@ class Client:
             del data_view
             del random_view
 
-    def _cleanup_session_resources(self, resources_acquired: bool):
-        """Comprehensive cleanup of session resources."""
-        with self._state_lock:
-            try:
-                # Stop listening first
-                self.stop_listening()
-                
-                # Set flags to stop all monitoring threads
-                self.running = False
-                self.listening = False
-                
-                # Clear secure storage
-                self._secure_storage.clear()
-                
-                # Close socket
-                if self.socket:
-                    try:
-                        # Only shutdown if socket is still connected
-                        if self.is_connected():
-                            self.socket.shutdown(socket.SHUT_RDWR)
-                    except Exception:
-                        pass
-                    try:
-                        self.socket.close()
-                    except Exception:
-                        pass
-                    self.socket = None
-                    
-                # Reset state
-                self._connected = False
-                self.sequence_manager.reset()
-                self.nonce_manager.cleanup_old_nonces()
-                
-                # Wait for monitoring threads to finish
-                if self.listen_thread and self.listen_thread.is_alive():
-                    self.listen_thread.join(timeout=2)
-                if hasattr(self, 'heartbeat_thread') and self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                    self.heartbeat_thread.join(timeout=2)
-                
-            except Exception as e:
-                log_error(ErrorCode.CLEANUP_ERROR, f"Resource cleanup failed: {e}")
-
     def send_message(self, message: str) -> bool:
         """Send an encrypted message to the server."""
         try:
@@ -627,92 +483,6 @@ class Client:
             log_error(ErrorCode.COMMUNICATION_ERROR, f"Failed to send message: {e}")
             return False
 
-    def _handle_encryption_failure(self):
-        """Thread-safe encryption failure handling with error propagation."""
-        try:
-            with self._key_lock:
-                with self._storage_lock:
-                    key_data = self._secure_storage.retrieve('session_key')
-                    if not key_data:
-                        error_msg = "No active session key"
-                        self._notify_error(ErrorCode.SECURITY_ERROR, error_msg)
-                        self.terminate_session()
-                        raise SecurityError(error_msg)
-
-                    # Update failure count
-                    key_data['encryption_failures'] += 1
-                    self._secure_storage.store('session_key', key_data)
-
-                    if key_data['encryption_failures'] >= self.max_encryption_failures:
-                        error_msg = "Maximum encryption failures exceeded"
-                        self._notify_error(ErrorCode.SECURITY_ERROR, error_msg)
-                        self.terminate_session()
-                        raise SecurityError(error_msg)
-                    else:
-                        # Attempt key renewal
-                        self._initiate_key_renewal()
-
-        except Exception as e:
-            error_msg = f"Encryption failure handling error: {e}"
-            self._notify_error(ErrorCode.ENCRYPTION_ERROR, error_msg)
-            self.terminate_session()
-            raise
-
-    def _handle_send_failure(self):
-        """Handle send operation failure with state recovery."""
-        with self._state_lock:
-            try:
-                # Attempt to verify connection
-                self.socket.settimeout(5)
-                self.socket.send(b'')
-            except Exception:
-                # Connection is dead, initiate recovery
-                self._initiate_recovery()
-
-    def _initiate_recovery(self):
-        """Attempt to recover from connection failure."""
-        with self._state_lock:
-            try:
-                # Save current state
-                old_session_key = self._secure_storage.retrieve('session_key')
-                old_server_key = self._secure_storage.retrieve('server_public_key')
-                
-                # Attempt reconnection
-                if self._attempt_reconnection():
-                    # Verify recovered state
-                    if not self._verify_session_state():
-                        # State verification failed, terminate and cleanup
-                        self.terminate_session()
-                        raise RuntimeError("Failed to verify recovered session state")
-                else:
-                    # Reconnection failed, terminate session
-                    self.terminate_session()
-                    raise RuntimeError("Failed to recover connection")
-                    
-            finally:
-                # Clear old keys
-                if old_session_key:
-                    self._secure_clear_bytes(old_session_key)
-                if old_server_key:
-                    self._secure_clear_bytes(old_server_key)
-
-    def receive_messages(self):
-        """Receive messages with timeout handling."""
-        while self.listening:
-            try:
-                # Receive raw data from socket
-                data = receiveData(self.socket)
-                if data:
-                    # Process the received message
-                    self.process_server_message(data)
-                    # Update activity timestamp
-                    self._update_activity_timestamp()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.listening:  # Only log if we're still meant to be listening
-                    log_error(ErrorCode.NETWORK_ERROR, f"Receive error: {e}")
-                    self._check_connection_state()
 
     def handle_key_renewal_request(self):
         """Handle key renewal with state synchronization."""
@@ -735,7 +505,7 @@ class Client:
                     self._send_key_renewal_request(new_public_key)
                     
                     # Wait for and verify server response
-                    if not self._handle_renewal_response():
+                    if not self.handle_key_renewal_response():
                         raise RuntimeError("Failed to complete key renewal")
                     
                     # Commit new keys
@@ -811,15 +581,22 @@ class Client:
     def terminate_session(self):
         """Enhanced session termination with state and resource cleanup."""
         try:
-            # Should add a termination message to server before cleanup
-            termination_message = packageMessage(
-                encryptedMessage='',
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=int(time.time()),
-                type=MessageType.SESSION_TERMINATION.value
-            )
-            sendData(self.socket, termination_message)  # Sends termination message
+            # Send termination message if socket is available before stopping listener
+            if self.socket is not None:
+                termination_message = packageMessage(
+                    encryptedMessage='',
+                    signature='',
+                    nonce=self.nonce_manager.generate_nonce(),
+                    timestamp=int(time.time()),
+                    type=MessageType.SESSION_TERMINATION.value
+                )
+                try:
+                    sendData(self.socket, termination_message)
+                except Exception as e:
+                    log_error(ErrorCode.NETWORK_ERROR, f"Failed to send termination message: {e}")
+            
+            # Now stop listening (this will close the socket)
+            self.stop_listening()
             
             self._update_state({
                 'connection_active': False,
@@ -827,7 +604,7 @@ class Client:
                 'key_exchange_complete': False
             })
             
-            # Stop all monitoring threads
+            # Stop all monitoring threads and cleanup resources
             self._cleanup_resources()
             
             # Clear secure storage
@@ -858,14 +635,19 @@ class Client:
                 if self._listener_thread and self._listener_thread.is_alive():
                     return  # Already listening
                 
-                self.listening = True  # Set flag before starting thread
-                self._listener_thread = threading.Thread(target=self._listen_for_messages)
-                self._listener_thread.start()
+                # Reset shutdown flag and set a short timeout so our listener loop can periodically check for shutdown.
+                self._shutting_down = False
+                self.listening = True
+                if self.socket:
+                    self.socket.settimeout(1)
+                self.listen_thread = threading.Thread(target=self._listen_for_messages)
+                self.listen_thread.daemon = True
+                self.listen_thread.start()
                 
                 # Wait briefly to ensure thread starts
                 time.sleep(0.1)
                 
-                if not self._listener_thread.is_alive():
+                if not self.listen_thread.is_alive():
                     raise RuntimeError("Listener thread failed to start")
                     
                 log_event("Communication", "Started listening for server messages")
@@ -878,29 +660,23 @@ class Client:
     def stop_listening(self):
         """Stop listening for server messages."""
         try:
-            # First set the flag to stop the listener thread
-            self.listening = False
-            self._connected = False  # Also mark as disconnected
-            
-            # If we have a socket, shut it down properly
-            if hasattr(self, 'socket') and self.socket:
+            # Signal the listener thread to stop
+            self._shutting_down = True
+            if self.socket:
                 try:
                     self.socket.shutdown(socket.SHUT_RDWR)
-                except socket.error:
-                    pass  # Socket might already be closed
-                try:
-                    self.socket.close()
-                except socket.error:
+                except Exception as e:
                     pass
+                self.socket.close()
                 self.socket = None
-                
-            # Wait for listener thread to finish
+            
+            # Wait for listener thread to finish (reduced timeout)
             with self._listener_lock:
-                if self._listener_thread and self._listener_thread.is_alive():
-                    self._listener_thread.join(timeout=2)
-                    if self._listener_thread.is_alive():
+                if self.listen_thread and self.listen_thread.is_alive():
+                    self.listen_thread.join(timeout=0.5)  # Reduced timeout from 2 to 0.5 seconds
+                    if self.listen_thread.is_alive():
                         log_error(ErrorCode.THREAD_ERROR, "Listener thread failed to stop")
-                    self._listener_thread = None
+                    self.listen_thread = None
                 
             log_event("Communication", "Stopped listening for server messages")
             
@@ -917,7 +693,7 @@ class Client:
         try:
             log_event("Communication", "Started message listener thread")
             
-            while self.listening and self._connected:
+            while not self._shutting_down:
                 try:
                     if not self.listening or not self._connected:
                         break
@@ -948,7 +724,7 @@ class Client:
                 except socket.timeout:
                     continue
                 except socket.error as e:
-                    if not self.listening:
+                    if self._shutting_down or not self.listening:  # Do not log errors during shutdown
                         break
                     if not connection_closed:  # Only log once
                         log_error(ErrorCode.NETWORK_ERROR, f"Socket error during receive: {e}")
@@ -965,88 +741,6 @@ class Client:
             self.listening = False
             log_event("Communication", "Message listener thread stopped")
 
-    def _validate_server_certificate_and_identity(self, hostname: str) -> None:
-        """
-        Comprehensively validate server certificate and identity.
-        
-        Args:
-            hostname (str): Expected server hostname
-            
-        Raises:
-            ValueError: If certificate validation fails
-            SecurityError: If identity verification fails
-        """
-        if not self.server_certificate:
-            raise ValueError("No server certificate available")
-
-        try:
-            # 1. Verify certificate chain
-            if not hasattr(self, 'tls_config') or not self.tls_config.ca_cert_path:
-                raise ValueError("No CA certificate configured")
-            
-            ca_cert = self.key_manager.load_certificate(self.tls_config.ca_cert_path)
-            if not self.key_manager.verify_certificate_chain(
-                self.server_certificate, 
-                ca_cert,
-                self.tls_config.cert_chain_path
-            ):
-                raise ValueError("Server certificate chain verification failed")
-
-            # 2. Verify certificate validity period
-            current_time = datetime.utcnow()
-            if current_time < self.server_certificate.not_valid_before:
-                raise ValueError("Server certificate not yet valid")
-            if current_time > self.server_certificate.not_valid_after:
-                raise ValueError("Server certificate has expired")
-
-            # 3. Verify hostname against SAN and CN
-            self._verify_hostname_in_cert(hostname)
-
-            # 4. Check certificate revocation if enabled
-            if self.tls_config.check_ocsp:
-                if not self.key_manager.check_certificate_revocation(
-                    self.server_certificate, 
-                    ca_cert
-                ):
-                    raise ValueError("Server certificate has been revoked")
-
-            # 5. Verify key usage and extended key usage
-            self._verify_certificate_usage()
-
-            log_event("Security", "Server certificate and identity validated successfully")
-
-        except Exception as e:
-            log_error(ErrorCode.AUTHENTICATION_ERROR, f"Certificate validation failed: {e}")
-            raise SecurityError(f"Certificate validation failed: {e}")
-
-    def _verify_hostname_in_cert(self, hostname: str) -> None:
-        """
-        Verify hostname against certificate SAN and CN fields.
-        
-        Args:
-            hostname (str): The hostname to verify
-            
-        Raises:
-            ValueError: If hostname verification fails
-        """
-        try:
-            # Check Subject Alternative Names (SAN)
-            san_ext = self.server_certificate.extensions.get_extension_for_oid(
-                ExtensionOID.SUBJECT_ALTERNATIVE_NAME
-            )
-            san_names = san_ext.value.get_values_for_type(x509.DNSName)
-            
-            if hostname in san_names:
-                return
-            
-            # Fallback to Common Name only if no SAN extension
-        except x509.ExtensionNotFound:
-            common_name = self.server_certificate.subject.get_attributes_for_oid(
-                x509.NameOID.COMMON_NAME
-            )[0].value
-            
-            if hostname != common_name:
-                raise ValueError(f"Hostname {hostname} doesn't match certificate")
 
     def process_server_message(self, data: bytes):
         """Process received server message."""
@@ -1144,10 +838,10 @@ class Client:
                 log_event("Communication", f"CLIENT RECEIVED ACK Received server acknowledgment: {decrypted_ack.decode('utf-8')}")
                 
             elif message_type == MessageType.KEY_RENEWAL_REQUEST.value:
-                self._handle_key_renewal_request(message)
+                self.handle_key_renewal_request()
                 
             elif message_type == MessageType.SESSION_TERMINATION.value:
-                self._handle_termination_request()
+                self.terminate_session()
                 
             elif message_type == MessageType.ERROR.value:
                 error_msg = message.get('encryptedMessage', 'Unknown error')
@@ -1159,271 +853,6 @@ class Client:
         except Exception as e:
             log_error(ErrorCode.GENERAL_ERROR, f"Error processing message: {e}")
 
-    def _verify_message_signature(self, message: dict) -> bool:
-        """Verify message signature and integrity."""
-        try:
-            # Create signature payload including all critical fields
-            signature_payload = {
-            'encryptedMessage': message.get('encryptedMessage', ''),
-            'nonce': message.get('nonce', ''),
-            'timestamp': message.get('timestamp', 0),
-            'type': message.get('type', ''),
-            'sequence': message.get('sequence', 0),
-            'sender_id': message.get('sender_id', 'server'),
-            'iv': message.get('iv', ''),
-            'tag': message.get('tag', '')
-            }
-            
-            signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
-            signature = message.get('signature')
-            
-            if not signature:
-                return False
-            
-            server_public_key = self._secure_storage.retrieve('server_public_key')
-            if not server_public_key:
-                return False
-            
-            return self.key_manager.verify_signature(
-                server_public_key,
-                signature_bytes,
-                bytes.fromhex(signature)
-            )
-            
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"Signature verification failed: {e}")
-            return False
-
-    def _handle_server_response(self, message_data: dict):
-        """Handle encrypted server response with validation."""
-        try:
-            # Get and validate session key
-            session_key = self.get_session_key()
-            if not session_key:
-                raise SecurityError("No active session key")
-            
-            # Decrypt and validate message
-            encrypted_msg = bytes.fromhex(message_data.get('encryptedMessage', ''))
-            iv = bytes.fromhex(message_data.get('iv', ''))
-            tag = bytes.fromhex(message_data.get('tag', ''))
-            
-            secure_msg = SecureMessage(
-                encrypted_message=encrypted_msg,
-                iv=iv,
-                tag=tag
-            )
-                        
-            decrypted_message = Crypto.decrypt(secure_msg, session_key)
-            
-            # Process decrypted message
-            if hasattr(self, 'message_handler') and self.message_handler:
-                self.message_handler(decrypted_message)
-            
-        except EncryptionError as e:
-            self._handle_encryption_failure()
-            raise
-        except Exception as e:
-            log_error(ErrorCode.ENCRYPTION_ERROR, f"Failed to process server response: {e}")
-            raise
-
-    def _complete_session_establishment(self, server_public_pem: bytes, private_pem: bytes) -> bool:
-        """Complete the session establishment process by loading keys and deriving session key."""
-        try:
-            # Load server's public key
-            self.server_public_key = serialization.load_pem_public_key(
-                server_public_pem,
-                backend=default_backend()
-            )
-            log_event("Key Exchange", "Server public key loaded successfully.")
-
-            # Load client's private key
-            self.private_key = serialization.load_pem_private_key(
-                private_pem,
-                password=None,
-                backend=default_backend()
-            )
-            log_event("Key Management", "Client private key loaded successfully.")
-
-            # Derive session key
-            context = b"session key derivation"
-            self.session_key = Crypto.derive_session_key(
-                self.server_public_key,
-                self.private_key,
-                context
-            )
-            log_event("Session", "Session key derived successfully.")
-            return True
-
-        except Exception as e:
-            log_error(ErrorCode.KEY_MANAGEMENT_ERROR, f"Failed to complete session establishment: {e}")
-            return False
-
-    def _receive_with_timeout(self, size: int, timeout: int) -> Optional[bytes]:
-        """
-        Receive data from socket with timeout and validation.
-        
-        Args:
-            size (int): Maximum size of data to receive
-            timeout (int): Timeout in seconds
-            
-        Returns:
-            Optional[bytes]: Received data or None if no data received
-        """
-        try:
-            self.socket.settimeout(timeout)
-            data = self.socket.recv(size)
-            if not data:
-                log_error(ErrorCode.NETWORK_ERROR, "Connection closed by peer")
-                return None
-            return data
-        except socket.timeout:
-            log_error(ErrorCode.NETWORK_ERROR, "Timeout while receiving data")
-            return None
-        except Exception as e:
-            log_error(ErrorCode.NETWORK_ERROR, f"Error receiving data: {e}")
-            return None
-        finally:
-            self.socket.settimeout(self.connection_timeout)  # Restore original timeout
-
-    def _validate_message(self, message: dict) -> bool:
-        """Comprehensive message validation."""
-        try:
-            # Validate basic message structure
-            if not isinstance(message, dict):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message format")
-                return False
-            
-            # Validate timestamp
-            timestamp = message.get('timestamp', 0)
-            current_time = int(time.time())
-            if abs(current_time - timestamp) > self._message_timeout:
-                log_error(ErrorCode.VALIDATION_ERROR, "Message timestamp outside acceptable range")
-                return False
-            
-            # Validate sequence number
-            sequence = message.get('sequence')
-            sender_id = message.get('sender_id', 'server')
-            if not self.sequence_manager.validate_sequence(sequence, sender_id):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message sequence")
-                return False
-
-            # Validate nonce
-            nonce = message.get('nonce')
-            if not self.nonce_manager.validate_nonce(nonce):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid or reused nonce")
-                return False
-
-            # Validate message type
-            message_type = message.get('type')
-            if not message_type or not isinstance(message_type, str):
-                log_error(ErrorCode.VALIDATION_ERROR, "Invalid message type")
-                return False
-            
-            # Validate message size
-            if len(str(message)) > self._max_message_size:
-                log_error(ErrorCode.VALIDATION_ERROR, "Message exceeds maximum size")
-                return False
-
-            return True
-            
-        except Exception as e:
-            log_error(ErrorCode.VALIDATION_ERROR, f"Message validation failed: {e}")
-            return False
-
-    def _verify_server_key_exchange(self, server_public_pem: bytes) -> bool:
-        """
-        Verify server's public key during key exchange.
-        
-        Args:
-            server_public_pem (bytes): Server's public key in PEM format
-            
-        Returns:
-            bool: True if verification succeeds
-            
-        Raises:
-            SecurityError: If key verification fails
-        """
-        try:
-            # 1. Verify key format and size
-            server_public_key = serialization.load_pem_public_key(
-                server_public_pem,
-                backend=default_backend()
-            )
-            
-            # 2. Verify key belongs to certificate
-            cert_public_key = self.server_certificate.public_key()
-            if server_public_key.public_numbers() != cert_public_key.public_numbers():
-                raise SecurityError("Server's public key doesn't match certificate")
-            
-            # 3. Generate and send challenge
-            challenge = os.urandom(32)
-            encrypted_challenge = server_public_key.encrypt(
-                challenge,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
-            )
-            
-            # Send challenge
-            self.socket.sendall(encrypted_challenge)
-            
-            # Receive and verify response
-            response = self._receive_complete_message(1024)
-            if response != challenge:
-                raise SecurityError("Server failed to prove key ownership")
-            
-            return True
-            
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"Server key verification failed: {e}")
-            raise SecurityError(f"Server key verification failed: {e}")
-
-    def _receive_complete_message(self, max_size: int, timeout: int = 30) -> bytes:
-        """
-        Receive a complete message with size prefix.
-        
-        Args:
-            max_size (int): Maximum allowed message size
-            timeout (int): Receive timeout in seconds
-            
-        Returns:
-            bytes: Complete message
-            
-        Raises:
-            ValueError: If message size exceeds limit
-            TimeoutError: If receive times out
-        """
-        try:
-            self.socket.settimeout(timeout)
-            
-            # Receive 4-byte size prefix
-            size_data = b''
-            while len(size_data) < 4:
-                chunk = self.socket.recv(4 - len(size_data))
-                if not chunk:
-                    raise ConnectionError("Connection closed while receiving size")
-                size_data += chunk
-                
-            message_size = int.from_bytes(size_data, byteorder='big')
-            if message_size > max_size:
-                raise ValueError(f"Message size {message_size} exceeds maximum {max_size}")
-                
-            # Receive complete message
-            message = b''
-            while len(message) < message_size:
-                chunk = self.socket.recv(min(4096, message_size - len(message)))
-                if not chunk:
-                    raise ConnectionError("Connection closed while receiving message")
-                message += chunk
-                
-            return message
-            
-        except socket.timeout:
-            raise TimeoutError("Receive operation timed out")
-        finally:
-            self.socket.settimeout(self.connection_timeout)
 
     def _secure_clear_memory(self, *objects):
         """Securely clear sensitive objects from memory."""
@@ -1474,8 +903,19 @@ class Client:
                 if not self._connected:
                     break
                     
-                time.sleep(self._heartbeat_interval)
-                
+                # Instead of sleeping for the full heartbeat interval at once,
+                # sleep in small increments to check for a shutdown signal.
+                heartbeat_interval = self._heartbeat_interval
+                interval_increment = 0.5  # seconds
+                elapsed = 0.0
+                while elapsed < heartbeat_interval:
+                    if self._shutting_down:
+                        break
+                    time.sleep(interval_increment)
+                    elapsed += interval_increment
+                if self._shutting_down:
+                    break
+                    
                 # Check connection state before sending
                 if not self.is_connected() or not self._connected:
                     break
@@ -1507,9 +947,16 @@ class Client:
 
     def _cleanup_loop(self):
         """Periodically check and cleanup stale connection state."""
-        while True:
+        while not self._shutting_down:
+            total_interval = self._cleanup_interval
+            interval_increment = 1  # seconds
+            elapsed = 0.0
+            while not self._shutting_down and elapsed < total_interval:
+                time.sleep(interval_increment)
+                elapsed += interval_increment
+            if self._shutting_down:
+                break
             try:
-                time.sleep(self._cleanup_interval)
                 self._check_connection_state()
             except Exception as e:
                 log_error(ErrorCode.GENERAL_ERROR, f"Cleanup loop error: {e}")
@@ -1609,37 +1056,6 @@ class Client:
         except Exception as e:
             log_error(ErrorCode.RESOURCE_ERROR, f"Error during connection cleanup: {e}")
 
-    def _verify_state_consistency(self) -> bool:
-        """Verify state consistency with server."""
-        try:
-            # Send state verification request
-            state_info = {
-                'messages_received': self._state['messages_received'],
-                'last_sequence': self._state['last_server_sequence'],
-                'last_key_renewal': self._state['last_key_renewal']
-            }
-            
-            verification_message = packageMessage(
-                encryptedMessage=json.dumps(state_info),
-                signature='',
-                nonce=self.nonce_manager.generate_nonce(),
-                timestamp=int(time.time()),
-                type=MessageType.STATE_VERIFICATION.value
-            )
-            
-            response = self._perform_with_timeout(
-                lambda: self._send_and_receive_verification(verification_message),
-                'verification'
-            )
-            
-            if not response or not self._validate_state_response(response):
-                raise StateError("State verification failed")
-            
-            return True
-            
-        except Exception as e:
-            log_error(ErrorCode.STATE_ERROR, f"State verification failed: {e}")
-            return False
 
     def _track_resource(self, resource_type: str, resource):
         """Track resource allocation."""
@@ -1709,70 +1125,6 @@ class Client:
                     pass
                 self._resources['socket'] = None
 
-    def _perform_tls_handshake(self):
-        """Perform TLS handshake with server."""
-        try:
-            log_event("Security", "Starting TLS handshake")
-            
-            # Create TLS context
-            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-            
-            # Configure TLS settings
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.check_hostname = True
-            
-            # Load certificates if provided
-            if hasattr(self, 'tls_config') and self.tls_config:
-                if self.tls_config.cert_path:
-                    context.load_cert_chain(
-                        certfile=str(self.tls_config.cert_path),
-                        keyfile=str(self.tls_config.key_path)
-                    )
-                if self.tls_config.ca_path:
-                    context.load_verify_locations(cafile=str(self.tls_config.ca_path))
-            
-            # Wrap socket with TLS
-            hostname = self.destination[0] if hasattr(self, 'destination') else None
-            self.socket = context.wrap_socket(
-                self.socket,
-                server_hostname=hostname
-            )
-            
-            log_event("Security", "TLS handshake completed successfully")
-            return True
-            
-        except ssl.SSLError as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"TLS handshake failed: {e}")
-            return False
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"TLS setup failed: {e}")
-            return False
-
-    def _sign_message(self, message_data: dict) -> str:
-        """Sign message data using the client's signing key."""
-        try:
-            # Create signature payload with relevant fields
-            signature_payload = {
-                'sequence': message_data.get('sequence'),
-                'encryptedMessage': message_data.get('encryptedMessage'),
-                'nonce': message_data.get('nonce'),
-                'timestamp': message_data.get('timestamp'),
-                'type': message_data.get('type')
-            }
-            
-            # Convert to bytes in a consistent format
-            signature_bytes = json.dumps(signature_payload, sort_keys=True).encode('utf-8')
-            
-            # Get signing key from key manager and use Crypto to sign
-            signing_key = self.key_manager.get_signing_key()
-            signature = Crypto.sign(data=signature_bytes, private_key=signing_key)
-            return signature.hex()
-            
-        except Exception as e:
-            log_error(ErrorCode.SECURITY_ERROR, f"Failed to sign message: {e}")
-            raise
-
     def _persist_state(self):
         """Persist current state to secure storage."""
         try:
@@ -1793,48 +1145,6 @@ class Client:
                 
         except Exception as e:
             log_error(ErrorCode.STATE_ERROR, f"Failed to persist state: {e}")
-
-    def _handle_key_exchange_response(self, response: dict) -> bool:
-        """Handle key exchange response from server."""
-        try:
-            # Extract server's public key and client ID
-            server_public_key_pem = response.get('public_key')
-            self.client_id = response.get('client_id')  # Store server-assigned ID
-            
-            if not server_public_key_pem or not self.client_id:
-                log_error(ErrorCode.KEY_EXCHANGE_ERROR, "Missing public key or client ID in response")
-                return False
-            
-            log_event("Security", f"[SECURE_SESSION] Using server-assigned client ID: {self.client_id}")
-            
-            # Load server's public key
-            server_public_key = serialization.load_pem_public_key(
-                server_public_key_pem.encode('utf-8'),
-                backend=default_backend()
-            )
-            
-            # Get private key and derive session key
-            log_event("Security", "[SECURE_SESSION] Getting private key and deriving session key")
-            private_key = self.key_manager.get_private_key()
-            
-            # Derive shared key
-            session_key = Crypto.derive_session_key(
-                peer_public_key=server_public_key,
-                private_key=private_key,
-                context=b'session key'
-            )
-            
-            # Store session key using server-assigned client ID
-            self.key_manager.store_session_key(self.client_id, session_key)
-            log_event("Security", "[SECURE_SESSION] Session key stored successfully")
-            # Add debug log for session key
-            log_event("Security", f"[DEBUG] Client session key (hex): {session_key.hex()}")
-            
-            return True
-            
-        except Exception as e:
-            log_error(ErrorCode.KEY_EXCHANGE_ERROR, f"Key exchange response handling failed: {e}")
-            return False
 
     def _cleanup_base(self):
         """Base cleanup for socket and resources."""
@@ -1906,13 +1216,24 @@ class Client:
             # Set shutdown flag
             self._shutting_down = True
             
-            # Cleanup session first
+            # Call terminate_session to send termination message and perform cleanup
             try:
-                self._cleanup_session()
+                self.terminate_session()
             except Exception as e:
-                log_error(ErrorCode.CLEANUP_ERROR, f"Session cleanup failed: {e}")
+                log_error(ErrorCode.SESSION_ERROR, f"Session termination failed during shutdown: {e}")
             
-            # Base cleanup - only call once
+            # Join the listener thread if running (reduced timeout)
+            if self.listen_thread is not None and self.listen_thread.is_alive():
+                self.listen_thread.join(timeout=0.5)  # Reduced timeout from 2 to 0.5 seconds
+            
+            # Optionally, if additional thread resources are stored in self._resources, iterate and join them.
+            if hasattr(self, '_resources'):
+                threads = self._resources.get('thread', [])
+                for thread in threads:
+                    if isinstance(thread, threading.Thread) and thread.is_alive():
+                        thread.join(timeout=0.5)  # Reduced timeout
+            
+            # Now perform base cleanup
             try:
                 self._cleanup_base()
             except Exception as e:

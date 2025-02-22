@@ -180,6 +180,7 @@ class ErrorCode(Enum):
     CLEANUP_ERROR = "CLEANUP_ERROR"
     CALLBACK_ERROR = "CALLBACK_ERROR"
     THREAD_ERROR = "THREAD_ERROR"
+    SERVER_ERROR = "SERVER_ERROR"
 
 class ErrorMessage:
     messages = {
@@ -201,7 +202,8 @@ class ErrorMessage:
         ErrorCode.ENCRYPTION_ERROR: "An encryption error occurred.",
         ErrorCode.CLEANUP_ERROR: "A cleanup error occurred.",
         ErrorCode.CALLBACK_ERROR: "A callback error occurred.",
-        ErrorCode.THREAD_ERROR: "A thread error occurred."
+        ErrorCode.THREAD_ERROR: "A thread error occurred.",
+        ErrorCode.SERVER_ERROR: "A server error occurred."
     }
 
 def throw_error(error_code, error_message=None):

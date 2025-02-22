@@ -67,8 +67,8 @@ def test_tls_communication():
         server = Server("localhost", 12345, tls_config=server_tls_config)
         client = Client(tls_config=client_tls_config)
 
-        # Set message handler for server
-        server.set_message_handler(server_message_handler)
+        # Instead of set_message_handler, assign the handler directly
+        server.message_handler = server_message_handler
 
         # Start server
         logging.info("Starting server...")
